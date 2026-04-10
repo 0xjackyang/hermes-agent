@@ -61,7 +61,7 @@ workflow surface.
 The shared helper script lives at:
 
 ```bash
-optional-skills/research/openkb/scripts/openkb_bridge.py
+$HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py
 ```
 
 It can run OpenKB locally or over SSH depending on environment variables.
@@ -106,8 +106,8 @@ Before doing KB work, always orient on the KB:
 Use:
 
 ```bash
-python optional-skills/research/openkb/scripts/openkb_bridge.py read-orient
-python optional-skills/research/openkb/scripts/openkb_bridge.py verify
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py read-orient
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py verify
 ```
 
 If `openkb verify` fails, stop and repair the KB/runtime before ingesting or
@@ -118,7 +118,7 @@ filing content.
 1. Run:
 
 ```bash
-python optional-skills/research/openkb/scripts/openkb_bridge.py recall --json "<question>"
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py recall --json "<question>"
 ```
 
 2. Read only the top returned pages.
@@ -126,7 +126,7 @@ python optional-skills/research/openkb/scripts/openkb_bridge.py recall --json "<
 4. If the answer is durable and grounded in KB sources, file it:
 
 ```bash
-python optional-skills/research/openkb/scripts/openkb_bridge.py file-query \
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py file-query \
   --stdin \
   --question "<question>" \
   --sources slug1,slug2
@@ -139,24 +139,24 @@ Do not ask OpenKB to re-synthesize an answer you already wrote.
 Use one of:
 
 ```bash
-python optional-skills/research/openkb/scripts/openkb_bridge.py ingest-url <url>
-python optional-skills/research/openkb/scripts/openkb_bridge.py ingest <path>
-python optional-skills/research/openkb/scripts/openkb_bridge.py ingest-scan
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py ingest-url <url>
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py ingest <path>
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py ingest-scan
 ```
 
 After explicit ingest, run:
 
 ```bash
-python optional-skills/research/openkb/scripts/openkb_bridge.py maintain --quick
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py maintain --quick
 ```
 
 ## Audit / Ops
 
 ```bash
-python optional-skills/research/openkb/scripts/openkb_bridge.py verify
-python optional-skills/research/openkb/scripts/openkb_bridge.py doctor
-python optional-skills/research/openkb/scripts/openkb_bridge.py lint --full
-python optional-skills/research/openkb/scripts/openkb_bridge.py maintain --full
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py verify
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py doctor
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py lint --full
+python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py maintain --full
 ```
 
 ## Filing Policy
