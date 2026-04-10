@@ -47,7 +47,7 @@ def provider(monkeypatch):
     monkeypatch.setenv("OPENKB_BRIDGE_COMMAND", "python3")
     monkeypatch.setenv("OPENKB_BRIDGE_EXPORT_ENABLED", "1")
     monkeypatch.setenv("OPENKB_BRIDGE_WRITEBACK_ENABLED", "1")
-    monkeypatch.setenv("OPENKB_BRIDGE_PUBLIC_URL", "https://kb.jackyang.com")
+    monkeypatch.setenv("OPENKB_BRIDGE_PUBLIC_URL", "https://kb.example.com")
     monkeypatch.setattr("plugins.memory.openviking._VikingClient", FakeClient)
 
     calls = []
@@ -88,10 +88,10 @@ def test_format_openkb_context_includes_public_reference():
                 "last_updated": "2026-04-10",
             }
         ],
-        "https://kb.jackyang.com",
+        "https://kb.example.com",
     )
     assert "<openkb-knowledge-base>" in block
-    assert "https://kb.jackyang.com" in block
+    assert "https://kb.example.com" in block
     assert "OpenKB" in block
 
 

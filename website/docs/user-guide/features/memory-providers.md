@@ -239,6 +239,7 @@ echo "OPENKB_BRIDGE_ENABLED=1" >> ~/.hermes/.env
 echo "OPENKB_BRIDGE_COMMAND=/path/to/hermes-agent/optional-skills/research/openkb/scripts/openkb_bridge.py" >> ~/.hermes/.env
 echo "OPENKB_BRIDGE_EXPORT_ENABLED=1" >> ~/.hermes/.env
 echo "OPENKB_BRIDGE_WRITEBACK_ENABLED=1" >> ~/.hermes/.env
+echo "OPENKB_BRIDGE_PUBLIC_URL=https://kb.example.com" >> ~/.hermes/.env
 ```
 
 Then configure how Hermes reaches OpenKB:
@@ -250,7 +251,7 @@ echo "OPENKB_EXEC_BIN=openkb" >> ~/.hermes/.env
 
 # Or remote OpenKB over SSH
 echo "OPENKB_EXEC_MODE=ssh" >> ~/.hermes/.env
-echo "OPENKB_EXEC_HOST=spark-jack" >> ~/.hermes/.env
+echo "OPENKB_EXEC_HOST=your-openkb-host" >> ~/.hermes/.env
 echo "OPENKB_EXEC_BIN=openkb" >> ~/.hermes/.env
 echo "OPENKB_EXEC_VENV_ACTIVATE=~/openkb-runtime/venv/bin/activate" >> ~/.hermes/.env
 echo "OPENKB_EXEC_KB_HOME=~/openkb-kb" >> ~/.hermes/.env

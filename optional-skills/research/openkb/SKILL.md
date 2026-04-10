@@ -86,26 +86,26 @@ The helper script reads these environment variables at runtime:
 - `OPENKB_EXEC_KB_HOME=<path>` used for orientation reads
 - `OPENKB_ORIENTATION_LOG_LINES=<n>` defaults to `30`
 
-For remote Spark usage, a typical profile `.env` block looks like:
+For a remote OpenKB host, a typical profile `.env` block looks like:
 
 ```bash
 OPENKB_EXEC_MODE=ssh
-OPENKB_EXEC_HOST=spark-jack
+OPENKB_EXEC_HOST=your-openkb-host
 OPENKB_EXEC_BIN=openkb
-OPENKB_EXEC_VENV_ACTIVATE=~/openkb-runtime/venv/bin/activate
+OPENKB_EXEC_VENV_ACTIVATE=~/openkb-runtime/venv/bin/activate   # if needed
 OPENKB_EXEC_KB_HOME=~/openkb-kb
 OPENKB_BRIDGE_ENABLED=1
 OPENKB_BRIDGE_COMMAND=/path/to/hermes-agent/optional-skills/research/openkb/scripts/openkb_bridge.py
 OPENKB_BRIDGE_EXPORT_ENABLED=1
 OPENKB_BRIDGE_WRITEBACK_ENABLED=1
-OPENKB_BRIDGE_PUBLIC_URL=https://kb.jackyang.com
+OPENKB_BRIDGE_PUBLIC_URL=https://kb.example.com
 ```
 
 For a local OpenKB runtime, use the configured CLI directly:
 
 ```bash
 openkb verify
-openkb recall --json "rowboat"
+openkb recall --json "your topic"
 ```
 
 ## Session Orientation
@@ -127,10 +127,10 @@ For ingest, filing, maintenance, or broader KB work, orient first:
 If OpenKB is local, use the configured KB path and CLI directly:
 
 ```bash
-sed -n '1,220p' /home/jackyujieyang/openkb-kb/SCHEMA.md
-sed -n '1,220p' /home/jackyujieyang/openkb-kb/index.md
-tail -n 30 /home/jackyujieyang/openkb-kb/log.md
-/home/jackyujieyang/.local/bin/openkb verify
+sed -n '1,220p' "$OPENKB_EXEC_KB_HOME/SCHEMA.md"
+sed -n '1,220p' "$OPENKB_EXEC_KB_HOME/index.md"
+tail -n 30 "$OPENKB_EXEC_KB_HOME/log.md"
+openkb verify
 ```
 
 Only use the helper wrapper if the profile is explicitly using a remote/SSH
@@ -152,7 +152,7 @@ filing content.
    this is the first step.
 
 ```bash
-/home/jackyujieyang/.local/bin/openkb recall --json "<question>"
+openkb recall --json "<question>"
 ```
 
 2. Read only the top returned pages.
@@ -160,7 +160,7 @@ filing content.
 4. If the answer is durable and grounded in KB sources, file it:
 
 ```bash
-/home/jackyujieyang/.local/bin/openkb file-query \
+openkb file-query \
   --stdin \
   --question "<question>" \
   --sources slug1,slug2
@@ -173,24 +173,24 @@ Do not ask OpenKB to re-synthesize an answer you already wrote.
 Use one of:
 
 ```bash
-/home/jackyujieyang/.local/bin/openkb ingest --url <url>
-/home/jackyujieyang/.local/bin/openkb ingest <path>
-/home/jackyujieyang/.local/bin/openkb ingest --scan
+openkb ingest --url <url>
+openkb ingest <path>
+openkb ingest --scan
 ```
 
 After explicit ingest, run:
 
 ```bash
-/home/jackyujieyang/.local/bin/openkb maintain --quick
+openkb maintain --quick
 ```
 
 ## Audit / Ops
 
 ```bash
-/home/jackyujieyang/.local/bin/openkb verify
-/home/jackyujieyang/.local/bin/openkb doctor
-/home/jackyujieyang/.local/bin/openkb lint --full
-/home/jackyujieyang/.local/bin/openkb maintain --full
+openkb verify
+openkb doctor
+openkb lint --full
+openkb maintain --full
 ```
 
 ## Filing Policy

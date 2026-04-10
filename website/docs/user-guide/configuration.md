@@ -364,7 +364,7 @@ skills:
     openkb:
       bin: openkb
       kb_path: ~/openkb-kb
-      public_url: https://kb.jackyang.com
+      public_url: https://kb.example.com
       orientation_log_lines: 30
       auto_file_queries: true
       file_query_min_chars: 1200
@@ -381,6 +381,7 @@ skills:
 ```bash
 hermes config set skills.config.wiki.path ~/my-research-wiki
 hermes config set skills.config.openkb.kb_path ~/openkb-kb
+hermes config set skills.config.openkb.public_url https://kb.example.com
 ```
 
 For details on declaring config settings in your own skills, see [Creating Skills — Config Settings](/docs/developer-guide/creating-skills#config-settings-configyaml).
