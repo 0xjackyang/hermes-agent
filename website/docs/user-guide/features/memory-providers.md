@@ -229,6 +229,37 @@ echo "OPENVIKING_ENDPOINT=http://localhost:1933" >> ~/.hermes/.env
 - Automatic memory extraction on session commit (profile, preferences, entities, events, cases, patterns)
 - `viking://` URI scheme for hierarchical knowledge browsing
 
+**Optional OpenKB bridge:**
+
+If you want OpenViking to remain the sole memory provider while still using
+OpenKB as an explicit knowledge-base skill, enable the bridge:
+
+```bash
+echo "OPENKB_BRIDGE_ENABLED=1" >> ~/.hermes/.env
+echo "OPENKB_BRIDGE_COMMAND=/path/to/hermes-agent/optional-skills/research/openkb/scripts/openkb_bridge.py" >> ~/.hermes/.env
+echo "OPENKB_BRIDGE_EXPORT_ENABLED=1" >> ~/.hermes/.env
+echo "OPENKB_BRIDGE_WRITEBACK_ENABLED=1" >> ~/.hermes/.env
+```
+
+Then configure how Hermes reaches OpenKB:
+
+```bash
+# Local OpenKB
+echo "OPENKB_EXEC_MODE=local" >> ~/.hermes/.env
+echo "OPENKB_EXEC_BIN=openkb" >> ~/.hermes/.env
+
+# Or remote OpenKB over SSH
+echo "OPENKB_EXEC_MODE=ssh" >> ~/.hermes/.env
+echo "OPENKB_EXEC_HOST=spark-jack" >> ~/.hermes/.env
+echo "OPENKB_EXEC_BIN=openkb" >> ~/.hermes/.env
+echo "OPENKB_EXEC_VENV_ACTIVATE=~/openkb-runtime/venv/bin/activate" >> ~/.hermes/.env
+echo "OPENKB_EXEC_KB_HOME=~/openkb-kb" >> ~/.hermes/.env
+```
+
+This keeps `memory.provider: openviking` while letting the provider enrich
+prefetch with OpenKB recall and mirror durable memory writes into OpenKB via
+`openkb bridge import-openviking --stdin`.
+
 ---
 
 ### Mem0

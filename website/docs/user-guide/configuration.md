@@ -361,6 +361,13 @@ skills:
   config:
     wiki:
       path: ~/wiki          # Used by the llm-wiki skill
+    openkb:
+      bin: openkb
+      kb_path: ~/openkb-kb
+      public_url: https://kb.jackyang.com
+      orientation_log_lines: 30
+      auto_file_queries: true
+      file_query_min_chars: 1200
 ```
 
 **How skill settings work:**
@@ -373,6 +380,7 @@ skills:
 
 ```bash
 hermes config set skills.config.wiki.path ~/my-research-wiki
+hermes config set skills.config.openkb.kb_path ~/openkb-kb
 ```
 
 For details on declaring config settings in your own skills, see [Creating Skills — Config Settings](/docs/developer-guide/creating-skills#config-settings-configyaml).

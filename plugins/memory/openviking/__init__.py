@@ -27,7 +27,13 @@ import atexit
 import json
 import logging
 import os
+import shlex
+import shutil
+import subprocess
+import sys
 import threading
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -37,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _TIMEOUT = 30.0
+_DEFAULT_OPENKB_BRIDGE_ENABLED = False
+_DEFAULT_OPENKB_BRIDGE_EXPORT_ENABLED = True
+_DEFAULT_OPENKB_BRIDGE_WRITEBACK_ENABLED = True
+_DEFAULT_OPENKB_BRIDGE_REFRESH_SECONDS = 900
+_DEFAULT_OPENKB_BRIDGE_RECALL_LIMIT = 4
+_DEFAULT_OPENKB_BRIDGE_PUBLIC_URL = ""
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +73,73 @@ def _atexit_commit_sessions():
 
 
 atexit.register(_atexit_commit_sessions)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _default_openkb_bridge_command() -> str:
+    return str(
+        Path(__file__).resolve().parents[3]
+        / "optional-skills"
+        / "research"
+        / "openkb"
+        / "scripts"
+        / "openkb_bridge.py"
+    )
+
+
+def _trim_openkb_summary(text: str, max_chars: int = 240) -> str:
+    clean = " ".join((text or "").split())
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 3].rstrip() + "..."
+
+
+def _format_openkb_context(items: List[Dict[str, Any]], public_url: str = "") -> str:
+    if not items:
+        return ""
+    header = "The following OpenKB entries may be relevant."
+    if public_url:
+        header += f" Public reference: {public_url}"
+    lines: List[str] = []
+    for item in items:
+        title = str(item.get("title") or item.get("slug") or "Untitled")
+        summary = _trim_openkb_summary(str(item.get("summary") or item.get("path") or title))
+        meta: List[str] = []
+        slug = str(item.get("slug") or "").strip()
+        if slug:
+            meta.append(slug)
+        last_updated = str(item.get("last_updated") or "").strip()
+        if last_updated:
+            meta.append(f"updated {last_updated}")
+        score = item.get("score")
+        if isinstance(score, (int, float)):
+            meta.append(f"score {score:.2f}")
+        if meta:
+            title = f"{title} ({'; '.join(meta)})"
+        lines.append(f"- {title}: {summary}")
+    return "<openkb-knowledge-base>\n" + header + "\n" + "\n".join(lines) + "\n</openkb-knowledge-base>"
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +341,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
+        self._write_thread: Optional[threading.Thread] = None
+        self._openkb_bridge_enabled = False
+        self._openkb_bridge_command = ""
+        self._openkb_bridge_export_enabled = True
+        self._openkb_bridge_writeback_enabled = True
+        self._openkb_bridge_refresh_seconds = _DEFAULT_OPENKB_BRIDGE_REFRESH_SECONDS
+        self._openkb_bridge_recall_limit = _DEFAULT_OPENKB_BRIDGE_RECALL_LIMIT
+        self._openkb_bridge_public_url = _DEFAULT_OPENKB_BRIDGE_PUBLIC_URL
+        self._openkb_last_export_at = 0.0
 
     @property
     def name(self) -> str:
@@ -293,6 +381,33 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._api_key = os.environ.get("OPENVIKING_API_KEY", "")
         self._session_id = session_id
         self._turn_count = 0
+        self._openkb_bridge_enabled = _env_bool("OPENKB_BRIDGE_ENABLED", _DEFAULT_OPENKB_BRIDGE_ENABLED)
+        self._openkb_bridge_command = (
+            os.environ.get("OPENKB_BRIDGE_COMMAND", "").strip() or _default_openkb_bridge_command()
+        )
+        self._openkb_bridge_export_enabled = _env_bool(
+            "OPENKB_BRIDGE_EXPORT_ENABLED",
+            _DEFAULT_OPENKB_BRIDGE_EXPORT_ENABLED,
+        )
+        self._openkb_bridge_writeback_enabled = _env_bool(
+            "OPENKB_BRIDGE_WRITEBACK_ENABLED",
+            _DEFAULT_OPENKB_BRIDGE_WRITEBACK_ENABLED,
+        )
+        self._openkb_bridge_refresh_seconds = _env_int(
+            "OPENKB_BRIDGE_REFRESH_SECONDS",
+            _DEFAULT_OPENKB_BRIDGE_REFRESH_SECONDS,
+            minimum=60,
+            maximum=86_400,
+        )
+        self._openkb_bridge_recall_limit = _env_int(
+            "OPENKB_BRIDGE_RECALL_LIMIT",
+            _DEFAULT_OPENKB_BRIDGE_RECALL_LIMIT,
+            minimum=1,
+            maximum=12,
+        )
+        self._openkb_bridge_public_url = (
+            os.environ.get("OPENKB_BRIDGE_PUBLIC_URL", "").strip() or _DEFAULT_OPENKB_BRIDGE_PUBLIC_URL
+        )
 
         try:
             self._client = _VikingClient(self._endpoint, self._api_key)
@@ -307,6 +422,80 @@ class OpenVikingMemoryProvider(MemoryProvider):
         global _last_active_provider
         _last_active_provider = self
 
+        if self._openkb_bridge_enabled and not self._openkb_command_exists():
+            logger.warning("OpenKB bridge enabled but command not found: %s", self._openkb_bridge_command)
+            self._openkb_bridge_enabled = False
+        if self._openkb_bridge_enabled and self._openkb_bridge_export_enabled:
+            try:
+                self._refresh_openkb_export("initialize", force=True)
+            except Exception as exc:
+                logger.warning("OpenKB bridge export refresh failed during initialize: %s", exc)
+
+    def _openkb_command_parts(self) -> List[str]:
+        parts = shlex.split(self._openkb_bridge_command)
+        if len(parts) == 1 and parts[0].endswith(".py"):
+            return [sys.executable, parts[0]]
+        return parts
+
+    def _openkb_command_exists(self) -> bool:
+        parts = self._openkb_command_parts()
+        if not parts:
+            return False
+        first = parts[0]
+        if first == sys.executable:
+            return len(parts) >= 2 and Path(parts[1]).exists()
+        if os.path.sep in first or (os.path.altsep and os.path.altsep in first):
+            return Path(first).exists()
+        return shutil.which(first) is not None
+
+    def _run_openkb_command(
+        self,
+        *args: str,
+        input_text: str = "",
+        timeout: float = _TIMEOUT,
+    ) -> str:
+        if not self._openkb_bridge_enabled:
+            return ""
+        cmd = [*self._openkb_command_parts(), *args]
+        result = subprocess.run(
+            cmd,
+            input=input_text if input_text else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"OpenKB bridge command failed: {' '.join(cmd)}")
+        return result.stdout.strip()
+
+    def _refresh_openkb_export(self, reason: str, *, force: bool = False) -> None:
+        if not self._openkb_bridge_enabled or not self._openkb_bridge_export_enabled:
+            return
+        now = time.monotonic()
+        if not force and self._openkb_last_export_at:
+            if now - self._openkb_last_export_at < self._openkb_bridge_refresh_seconds:
+                return
+        self._run_openkb_command(
+            "bridge-export",
+            timeout=max(_TIMEOUT, float(self._openkb_bridge_refresh_seconds)),
+        )
+        self._openkb_last_export_at = now
+        logger.info("OpenKB bridge export refreshed (%s)", reason)
+
+    def _recall_openkb(self, query: str) -> str:
+        if not self._openkb_bridge_enabled or not query.strip():
+            return ""
+        self._refresh_openkb_export("prefetch")
+        raw = self._run_openkb_command("recall", "--json", query, timeout=_TIMEOUT)
+        try:
+            parsed = json.loads(raw or "[]")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"OpenKB bridge returned invalid JSON: {exc}") from exc
+        if not isinstance(parsed, list):
+            return ""
+        items = [item for item in parsed if isinstance(item, dict)]
+        return _format_openkb_context(items[: self._openkb_bridge_recall_limit], self._openkb_bridge_public_url)
+
     def system_prompt_block(self) -> str:
         if not self._client:
             return ""
@@ -318,20 +507,32 @@ class OpenVikingMemoryProvider(MemoryProvider):
             children = len(result) if isinstance(result, list) else 0
             if children == 0:
                 return ""
-            return (
+            block = (
                 "# OpenViking Knowledge Base\n"
                 f"Active. Endpoint: {self._endpoint}\n"
                 "Use viking_search to find information, viking_read for details "
                 "(abstract/overview/full), viking_browse to explore.\n"
                 "Use viking_remember to store facts, viking_add_resource to index URLs/docs."
             )
+            if self._openkb_bridge_enabled:
+                bridge_line = "\nOpenKB bridge active for explicit KB recall/writeback."
+                if self._openkb_bridge_public_url:
+                    bridge_line += f" Public KB: {self._openkb_bridge_public_url}"
+                block += bridge_line
+            return block
         except Exception:
-            return (
+            block = (
                 "# OpenViking Knowledge Base\n"
                 f"Active. Endpoint: {self._endpoint}\n"
                 "Use viking_search, viking_read, viking_browse, "
                 "viking_remember, viking_add_resource."
             )
+            if self._openkb_bridge_enabled:
+                bridge_line = "\nOpenKB bridge active for explicit KB recall/writeback."
+                if self._openkb_bridge_public_url:
+                    bridge_line += f" Public KB: {self._openkb_bridge_public_url}"
+                block += bridge_line
+            return block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return prefetched results from the background thread."""
@@ -366,6 +567,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         score = item.get("score", 0)
                         if abstract:
                             parts.append(f"- [{score:.2f}] {abstract} ({uri})")
+                if self._openkb_bridge_enabled:
+                    try:
+                        openkb_context = self._recall_openkb(query)
+                        if openkb_context:
+                            parts.append(openkb_context)
+                    except Exception as e:
+                        logger.debug("OpenKB bridge recall failed: %s", e)
                 if parts:
                     with self._prefetch_lock:
                         self._prefetch_result = "\n".join(parts)
@@ -451,11 +659,26 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         {"type": "text", "text": f"[Memory note — {target}] {content}"},
                     ],
                 })
+                if self._openkb_bridge_enabled and self._openkb_bridge_writeback_enabled:
+                    payload = {
+                        "title": f"OpenViking memory: {_trim_openkb_summary(content, 80)}",
+                        "content": content,
+                        "memory_action": action,
+                        "memory_target": target,
+                        "session_id": self._session_id,
+                        "source": "openviking",
+                    }
+                    self._run_openkb_command(
+                        "bridge-import-openviking",
+                        "--stdin",
+                        input_text=json.dumps(payload, ensure_ascii=False),
+                        timeout=max(_TIMEOUT, 60.0),
+                    )
             except Exception as e:
                 logger.debug("OpenViking memory mirror failed: %s", e)
 
-        t = threading.Thread(target=_write, daemon=True, name="openviking-memwrite")
-        t.start()
+        self._write_thread = threading.Thread(target=_write, daemon=True, name="openviking-memwrite")
+        self._write_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, ADD_RESOURCE_SCHEMA]
@@ -481,7 +704,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         # Wait for background threads to finish
-        for t in (self._sync_thread, self._prefetch_thread):
+        for t in (self._sync_thread, self._prefetch_thread, self._write_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
         # Clear atexit reference so it doesn't double-commit
