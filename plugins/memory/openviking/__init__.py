@@ -551,6 +551,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return
 
         def _run():
+            parts = []
             try:
                 client = _VikingClient(self._endpoint, self._api_key)
                 resp = client.post("/api/v1/search/find", {
@@ -558,7 +559,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "top_k": 5,
                 })
                 result = resp.get("result", {})
-                parts = []
                 for ctx_type in ("memories", "resources"):
                     items = result.get(ctx_type, [])
                     for item in items[:3]:
@@ -567,18 +567,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         score = item.get("score", 0)
                         if abstract:
                             parts.append(f"- [{score:.2f}] {abstract} ({uri})")
-                if self._openkb_bridge_enabled:
-                    try:
-                        openkb_context = self._recall_openkb(query)
-                        if openkb_context:
-                            parts.append(openkb_context)
-                    except Exception as e:
-                        logger.debug("OpenKB bridge recall failed: %s", e)
-                if parts:
-                    with self._prefetch_lock:
-                        self._prefetch_result = "\n".join(parts)
             except Exception as e:
                 logger.debug("OpenViking prefetch failed: %s", e)
+            if self._openkb_bridge_enabled:
+                try:
+                    openkb_context = self._recall_openkb(query)
+                    if openkb_context:
+                        parts.append(openkb_context)
+                except Exception as e:
+                    logger.debug("OpenKB bridge recall failed: %s", e)
+            if parts:
+                with self._prefetch_lock:
+                    self._prefetch_result = "\n".join(parts)
 
         self._prefetch_thread = threading.Thread(
             target=_run, daemon=True, name="openviking-prefetch"
