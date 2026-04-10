@@ -52,6 +52,10 @@ Use this skill when the user wants to:
 OpenViking remains the only memory provider. This skill is the explicit KB
 workflow surface.
 
+For normal KB operations, **prefer the configured OpenKB CLI directly**.
+Do not search the repo for helper scripts when the KB is already locally
+reachable through `skills.config.openkb.bin`.
+
 ## Runtime Model
 
 - OpenViking owns automatic memory prefetch and writeback
@@ -65,6 +69,9 @@ $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py
 ```
 
 It can run OpenKB locally or over SSH depending on environment variables.
+This helper is primarily for bridge/runtime plumbing. For explicit skill
+workflows, use the configured OpenKB CLI directly unless the profile is
+explicitly set up for remote-only access.
 
 ## Configuration
 
@@ -94,16 +101,42 @@ OPENKB_BRIDGE_WRITEBACK_ENABLED=1
 OPENKB_BRIDGE_PUBLIC_URL=https://kb.jackyang.com
 ```
 
+For a local OpenKB runtime, use the configured CLI directly:
+
+```bash
+openkb verify
+openkb recall --json "rowboat"
+```
+
 ## Session Orientation
 
-Before doing KB work, always orient on the KB:
+For **query-only lookups**, start with `openkb recall --json` first. Do not
+read `SCHEMA.md`, `index.md`, or `log.md` unless:
+
+- recall results are ambiguous
+- you are about to ingest or file content
+- you are about to modify or maintain the KB
+
+For ingest, filing, maintenance, or broader KB work, orient first:
 
 1. read `SCHEMA.md`
 2. read `index.md`
 3. read the most recent lines of `log.md`
 4. run `openkb verify`
 
-Use:
+If OpenKB is local, use the configured KB path and CLI directly:
+
+```bash
+sed -n '1,220p' /home/jackyujieyang/openkb-kb/SCHEMA.md
+sed -n '1,220p' /home/jackyujieyang/openkb-kb/index.md
+tail -n 30 /home/jackyujieyang/openkb-kb/log.md
+/home/jackyujieyang/.local/bin/openkb verify
+```
+
+Only use the helper wrapper if the profile is explicitly using a remote/SSH
+OpenKB transport.
+
+Helper form:
 
 ```bash
 python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py read-orient
@@ -115,10 +148,11 @@ filing content.
 
 ## Query Workflow
 
-1. Run:
+1. Run the configured OpenKB CLI directly. For simple answer-only questions,
+   this is the first step.
 
 ```bash
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py recall --json "<question>"
+/home/jackyujieyang/.local/bin/openkb recall --json "<question>"
 ```
 
 2. Read only the top returned pages.
@@ -126,7 +160,7 @@ python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py recall --jso
 4. If the answer is durable and grounded in KB sources, file it:
 
 ```bash
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py file-query \
+/home/jackyujieyang/.local/bin/openkb file-query \
   --stdin \
   --question "<question>" \
   --sources slug1,slug2
@@ -139,24 +173,24 @@ Do not ask OpenKB to re-synthesize an answer you already wrote.
 Use one of:
 
 ```bash
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py ingest-url <url>
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py ingest <path>
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py ingest-scan
+/home/jackyujieyang/.local/bin/openkb ingest --url <url>
+/home/jackyujieyang/.local/bin/openkb ingest <path>
+/home/jackyujieyang/.local/bin/openkb ingest --scan
 ```
 
 After explicit ingest, run:
 
 ```bash
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py maintain --quick
+/home/jackyujieyang/.local/bin/openkb maintain --quick
 ```
 
 ## Audit / Ops
 
 ```bash
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py verify
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py doctor
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py lint --full
-python $HERMES_HOME/skills/research/openkb/scripts/openkb_bridge.py maintain --full
+/home/jackyujieyang/.local/bin/openkb verify
+/home/jackyujieyang/.local/bin/openkb doctor
+/home/jackyujieyang/.local/bin/openkb lint --full
+/home/jackyujieyang/.local/bin/openkb maintain --full
 ```
 
 ## Filing Policy
