@@ -2,11 +2,19 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Start here
+- Read `RESOLVER.md` before spelunking the codebase.
+- Use `./ops/verify fast|standard|live --json` before claiming a change is complete.
+
 ## Development Environment
 
+On Spark, the live installed runtime venv is:
+
 ```bash
-source venv/bin/activate  # ALWAYS activate before running Python
+source /home/jackyujieyang/.local/share/hermes-agent-venv/bin/activate
 ```
+
+If you provision a repo-local `.venv`, that is also acceptable — but do not assume `venv/` exists.
 
 ## Project Structure
 

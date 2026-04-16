@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+MODE="${1:-fast}"
+JSON="false"
+[[ "${2:-}" == "--json" ]] && JSON="true"
+[[ "$MODE" == "--json" ]] && MODE="fast" && JSON="true"
+PY=/home/jackyujieyang/.local/share/hermes-agent-venv/bin/python
+run_json() {
+  python3 - <<'PY2' "$1" "$2" "$3"
+import json, sys
+print(json.dumps({"repo":"hermes-agent","mode":sys.argv[1],"ok":sys.argv[2]=='true',"details":sys.argv[3]}, indent=2))
+PY2
+}
+case "$MODE" in
+  fast)
+    cd /home/jackyujieyang/src/hermes-agent-openkb
+    "$PY" -m py_compile run_agent.py agent/prompt_builder.py tools/skills_tool.py >/dev/null
+    DETAIL='py_compile passed for key runtime files'
+    ;;
+  standard)
+    cd /home/jackyujieyang/src/hermes-agent-openkb
+    "$PY" -m py_compile run_agent.py agent/prompt_builder.py tools/skills_tool.py >/dev/null
+    "$PY" -m pytest -q tests/agent/test_prompt_builder.py tests/run_agent/test_run_agent.py >/dev/null
+    DETAIL='py_compile plus targeted runtime tests passed'
+    ;;
+  live)
+    cd /home/jackyujieyang/src/hermes-agent-openkb
+    "$PY" -m py_compile run_agent.py agent/prompt_builder.py tools/skills_tool.py >/dev/null
+    "$PY" -m pytest -q tests/agent/test_prompt_builder.py tests/run_agent/test_run_agent.py >/dev/null
+    "$PY" -m hermes_cli.main --help >/dev/null
+    DETAIL='targeted tests plus hermes CLI import path passed'
+    ;;
+  *) echo 'usage: ./ops/verify [fast|standard|live] [--json]' >&2; exit 2 ;;
+esac
+if [[ "$JSON" == "true" ]]; then run_json "$MODE" true "$DETAIL"; else echo "$DETAIL"; fi
