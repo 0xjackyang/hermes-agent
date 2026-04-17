@@ -80,6 +80,7 @@ DANGEROUS_PATTERNS = [
     (r'\bDELETE\s+FROM\b(?!.*\bWHERE\b)', "SQL DELETE without WHERE"),
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
     (r'>\s*/etc/', "overwrite system config"),
+    (r'\bsystemctl\b[^\n]*\b(?:reload-or-restart|try-restart|restart)\b[^\n]*\bhermes-gateway(?:-[\w.-]+)?\.service\b', "restart hermes gateway service"),
     (r'\bsystemctl\s+(stop|disable|mask)\b', "stop/disable system service"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
@@ -149,6 +150,18 @@ def _normalize_command_for_detection(command: str) -> str:
     # Normalize Unicode (fullwidth Latin, halfwidth Katakana, etc.)
     command = unicodedata.normalize('NFKC', command)
     return command
+
+
+def _is_blocked_cron_gateway_restart(command: str) -> bool:
+    """Return True when a cron-run command tries to restart a Hermes gateway unit."""
+    if not os.getenv("HERMES_CRON_JOB"):
+        return False
+    normalized = _normalize_command_for_detection(command).lower()
+    return bool(re.search(
+        r'\bsystemctl\b[^\n]*\b(?:reload-or-restart|try-restart|restart)\b[^\n]*\bhermes-gateway(?:-[\w.-]+)?\.service\b',
+        normalized,
+        re.IGNORECASE | re.DOTALL,
+    ))
 
 
 def detect_dangerous_command(command: str) -> tuple:
@@ -672,6 +685,18 @@ def check_all_command_guards(command: str, env_type: str,
     # Skip containers for both checks
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
+
+    if _is_blocked_cron_gateway_restart(command):
+        return {
+            "approved": False,
+            "status": "blocked",
+            "pattern_key": "restart hermes gateway service",
+            "description": "restart hermes gateway service from cron (self-restart loop risk)",
+            "message": (
+                "BLOCKED: Cron jobs may not restart Hermes gateway services from inside Hermes. "
+                "Use a detached operator path instead."
+            ),
+        }
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.

@@ -449,9 +449,11 @@ def create_job(
         "paused_reason": None,
         "created_at": now,
         "next_run_at": compute_next_run(parsed_schedule),
+        "last_started_at": None,
         "last_run_at": None,
         "last_status": None,
         "last_error": None,
+        "running_pid": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -592,6 +594,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             job["last_run_at"] = now
             job["last_status"] = "ok" if success else "error"
             job["last_error"] = error if not success else None
+            job["running_pid"] = None
             # Track delivery failures separately — cleared on successful delivery
             job["last_delivery_error"] = delivery_error
             
@@ -622,6 +625,38 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             return
     
     save_jobs(jobs)
+
+
+def mark_job_started(job_id: str) -> Optional[Dict[str, Any]]:
+    """Durably claim a one-shot job before execution begins.
+
+    This prevents a one-shot job from being rediscovered as still due if the
+    process dies after dispatch but before mark_job_run() persists completion.
+    The running PID is recorded so the current process can distinguish its own
+    in-flight job from an interrupted prior process.
+    """
+    jobs = load_jobs()
+    for i, job in enumerate(jobs):
+        if job["id"] != job_id:
+            continue
+
+        if job.get("schedule", {}).get("kind") != "once":
+            return None
+        if not job.get("enabled", True):
+            return None
+        if job.get("last_run_at"):
+            return None
+        if job.get("state") not in (None, "", "scheduled"):
+            return None
+
+        job["state"] = "running"
+        job["last_started_at"] = _hermes_now().isoformat()
+        job["running_pid"] = os.getpid()
+        job["next_run_at"] = None
+        jobs[i] = job
+        save_jobs(jobs)
+        return _apply_skill_fields(job)
+    return None
 
 
 def advance_next_run(job_id: str) -> bool:
@@ -667,6 +702,37 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     needs_save = False
 
     for job in jobs:
+        state = job.get("state") or ("scheduled" if job.get("enabled", True) else "paused")
+        schedule = job.get("schedule", {})
+        kind = schedule.get("kind")
+
+        if state == "running":
+            running_pid = job.get("running_pid")
+            if running_pid == os.getpid():
+                continue
+
+            if kind == "once" and not job.get("last_run_at"):
+                logger.warning(
+                    "Job '%s' was left in running state by PID %s; marking abandoned",
+                    job.get("name", job["id"]),
+                    running_pid,
+                )
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["state"] = "abandoned"
+                        rj["enabled"] = False
+                        rj["next_run_at"] = None
+                        rj["running_pid"] = None
+                        rj["last_status"] = "error"
+                        if not rj.get("last_error"):
+                            rj["last_error"] = "interrupted before completion state was persisted"
+                        needs_save = True
+                        break
+            continue
+
+        if state in {"paused", "completed", "failed", "abandoned"}:
+            continue
+
         if not job.get("enabled", True):
             continue
 

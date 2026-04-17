@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -73,6 +74,7 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     runner._pending_messages = {"session": "pending text"}
     runner._pending_approvals = {"session": {"command": "rm -rf /tmp/x"}}
     runner._background_tasks = set()
+    runner._cron_stop_event = threading.Event()
     runner._shutdown_all_gateway_honcho = lambda: None
 
     adapter = StubAdapter()
@@ -104,4 +106,5 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     assert runner._running_agents == {}
     assert runner._pending_messages == {}
     assert runner._pending_approvals == {}
+    assert runner._cron_stop_event.is_set() is True
     assert runner._shutdown_event.is_set() is True
