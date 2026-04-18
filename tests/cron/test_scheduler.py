@@ -1,5 +1,6 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -1162,6 +1163,77 @@ class TestTickAdvanceBeforeRun:
         adv_mock.assert_called_once_with("test-advance")
         # advance must happen before run
         assert call_order == [("advance", "test-advance"), ("run", "test-advance")]
+
+
+class TestTickConcurrentDueJobs:
+    def test_multiple_due_jobs_use_executor_and_advance_all_before_run(self, tmp_path):
+        call_order = []
+        submitted = []
+
+        def fake_advance(job_id):
+            call_order.append(("advance", job_id))
+            return True
+
+        def fake_run_job(job):
+            call_order.append(("run", job["id"]))
+            return True, f"output-{job['id']}", f"response-{job['id']}", None
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def submit(self, fn, job):
+                submitted.append((self.max_workers, job["id"]))
+                future = concurrent.futures.Future()
+                future.set_result(fn(job))
+                return future
+
+        jobs = [
+            {"id": "job-a", "name": "A", "prompt": "a", "enabled": True, "schedule": {"kind": "cron", "expr": "0 9 * * *"}},
+            {"id": "job-b", "name": "B", "prompt": "b", "enabled": True, "schedule": {"kind": "cron", "expr": "0 9 * * *"}},
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run", side_effect=fake_advance), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler.mark_job_run") as mark_mock, \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler._JOB_EXECUTOR_CLASS", FakeExecutor):
+            from cron.scheduler import tick
+            executed = tick(verbose=False)
+
+        assert executed == 2
+        assert call_order[:2] == [("advance", "job-a"), ("advance", "job-b")]
+        assert submitted == [(2, "job-a"), (2, "job-b")]
+        assert {step for step, _ in call_order[2:]} == {"run"}
+        assert mark_mock.call_count == 2
+
+    def test_single_due_job_skips_executor_path(self, tmp_path):
+        job = {"id": "job-one", "name": "One", "prompt": "hello", "enabled": True, "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
+
+        class FailIfUsedExecutor:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("executor path should not be used for one due job")
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "output", "response", None)) as run_job_mock, \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler._JOB_EXECUTOR_CLASS", FailIfUsedExecutor):
+            from cron.scheduler import tick
+            executed = tick(verbose=False)
+
+        assert executed == 1
+        run_job_mock.assert_called_once_with(job)
 
 
 class TestSendMediaViaAdapter:
