@@ -69,6 +69,7 @@ Thread safety:
     free-threading).
 """
 
+import atexit
 import asyncio
 import inspect
 import json
@@ -1080,6 +1081,41 @@ _lock = threading.Lock()
 # normal server shutdown.
 _stdio_pids: set = set()
 
+# PID that owns the current in-memory MCP globals. Forked child processes must
+# reset these so they do not inherit live connections / tracked subprocess PIDs
+# from the parent gateway process.
+_process_pid = os.getpid()
+
+
+def _reset_process_local_state() -> None:
+    """Reinitialize process-local MCP globals after a fork.
+
+    ProcessPoolExecutor / multiprocessing workers inherit module globals from the
+    parent gateway process. Those inherited objects include dead event-loop
+    references, stale ``_servers`` entries, and tracked stdio child PIDs that
+    belong to the parent. Resetting them in the child keeps cleanup scoped to
+    the current process and prevents forked helpers from killing the parent's
+    live MCP subprocesses on exit.
+    """
+    global _servers, _mcp_loop, _mcp_thread, _lock, _stdio_pids, _process_pid
+
+    _process_pid = os.getpid()
+    _servers = {}
+    _mcp_loop = None
+    _mcp_thread = None
+    _lock = threading.Lock()
+    _stdio_pids = set()
+
+
+def _ensure_process_local_state() -> None:
+    """Reset inherited MCP state when code is running in a forked child."""
+    if os.getpid() != _process_pid:
+        _reset_process_local_state()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_process_local_state)
+
 
 def _snapshot_child_pids() -> set:
     """Return a set of current child process PIDs.
@@ -1125,6 +1161,7 @@ def _mcp_loop_exception_handler(loop, context):
 def _ensure_mcp_loop():
     """Start the background event loop thread if not already running."""
     global _mcp_loop, _mcp_thread
+    _ensure_process_local_state()
     with _lock:
         if _mcp_loop is not None and _mcp_loop.is_running():
             return
@@ -1140,6 +1177,7 @@ def _ensure_mcp_loop():
 
 def _run_on_mcp_loop(coro, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done."""
+    _ensure_process_local_state()
     with _lock:
         loop = _mcp_loop
     if loop is None or not loop.is_running():
@@ -1887,6 +1925,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     Returns:
         List of all currently registered MCP tool names.
     """
+    _ensure_process_local_state()
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
@@ -1967,6 +2006,7 @@ def discover_mcp_tools() -> List[str]:
     Returns:
         List of all registered MCP tool names.
     """
+    _ensure_process_local_state()
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
@@ -2010,6 +2050,7 @@ def get_mcp_status() -> List[dict]:
     Returns a list of dicts with keys: name, transport, tools, connected.
     Includes both successfully connected servers and configured-but-failed ones.
     """
+    _ensure_process_local_state()
     result: List[dict] = []
 
     # Get configured servers from config
@@ -2055,6 +2096,7 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
         Dict mapping server name to list of (tool_name, description) tuples.
         Servers that fail to connect are omitted from the result.
     """
+    _ensure_process_local_state()
     if not _MCP_AVAILABLE:
         return {}
 
@@ -2117,6 +2159,7 @@ def shutdown_mcp_servers():
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
     """
+    _ensure_process_local_state()
     with _lock:
         servers_snapshot = list(_servers.values())
 
@@ -2192,3 +2235,14 @@ def _stop_mcp_loop():
         # After closing the loop, any stdio subprocesses that survived the
         # graceful shutdown are now orphaned.  Force-kill them.
         _kill_orphaned_mcp_children()
+
+
+def _shutdown_mcp_servers_atexit() -> None:
+    """Best-effort MCP cleanup for helper/worker process exit paths."""
+    try:
+        shutdown_mcp_servers()
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_mcp_servers_atexit)

@@ -6,6 +6,7 @@ All tests use mocks -- no real MCP servers or subprocesses are started.
 import asyncio
 import json
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -752,6 +753,83 @@ class TestShutdown:
         assert len(_servers) == 0
         # Parallel: ~1s, not ~3s. Allow some margin.
         assert elapsed < 2.5, f"Shutdown took {elapsed:.1f}s, expected ~1s (parallel)"
+
+
+# ---------------------------------------------------------------------------
+# Process-local MCP state
+# ---------------------------------------------------------------------------
+
+class TestProcessLocalState:
+    def test_reset_process_local_state_clears_inherited_resources(self):
+        import tools.mcp_tool as mcp_mod
+
+        stale_lock = threading.Lock()
+        stale_server = _make_mock_server("stale", session=MagicMock())
+
+        with patch("tools.mcp_tool.os.getpid", return_value=4321):
+            mcp_mod._process_pid = 1234
+            mcp_mod._servers = {"stale": stale_server}
+            mcp_mod._stdio_pids = {999}
+            mcp_mod._mcp_loop = object()
+            mcp_mod._mcp_thread = object()
+            mcp_mod._lock = stale_lock
+
+            mcp_mod._reset_process_local_state()
+
+        assert mcp_mod._process_pid == 4321
+        assert mcp_mod._servers == {}
+        assert mcp_mod._stdio_pids == set()
+        assert mcp_mod._mcp_loop is None
+        assert mcp_mod._mcp_thread is None
+        assert mcp_mod._lock is not stale_lock
+
+    def test_pid_change_forces_fresh_mcp_registration(self):
+        import tools.mcp_tool as mcp_mod
+        from tools.mcp_tool import MCPServerTask, register_mcp_servers
+
+        connected = []
+
+        async def fake_connect(name, config):
+            connected.append(name)
+            server = MCPServerTask(name)
+            server.session = MagicMock()
+            server._tools = []
+            return server
+
+        def fake_run(coro, timeout=30):
+            return asyncio.run(coro)
+
+        stale_server = _make_mock_server("discord_read", session=MagicMock())
+        stale_server._registered_tool_names = ["mcp_discord_read_old"]
+
+        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._register_server_tools", return_value=["mcp_discord_read_ping"]), \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run), \
+             patch("tools.mcp_tool._sync_mcp_toolsets"), \
+             patch("tools.mcp_tool.os.getpid", return_value=4321):
+            mcp_mod._process_pid = 1234
+            mcp_mod._servers = {"discord_read": stale_server}
+            mcp_mod._stdio_pids = {777}
+            mcp_mod._mcp_loop = object()
+            mcp_mod._mcp_thread = object()
+
+            result = register_mcp_servers({"discord_read": {"command": "node", "args": []}})
+
+        assert connected == ["discord_read"]
+        assert result == ["mcp_discord_read_ping"]
+        assert set(mcp_mod._servers) == {"discord_read"}
+        assert mcp_mod._stdio_pids == set()
+        assert mcp_mod._process_pid == 4321
+
+    def test_atexit_cleanup_delegates_to_shutdown(self):
+        from tools.mcp_tool import _shutdown_mcp_servers_atexit
+
+        with patch("tools.mcp_tool.shutdown_mcp_servers") as mock_shutdown:
+            _shutdown_mcp_servers_atexit()
+
+        mock_shutdown.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
