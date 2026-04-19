@@ -471,6 +471,11 @@ class GatewayRunner:
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
+    _AMBIENT_SIGNAL_TOOLSETS = ("gbrain", "skills")
+    _AMBIENT_SIGNAL_MAX_HISTORY = 6
+    _AMBIENT_SIGNAL_MAX_HISTORY_CHARS = 280
+    _AMBIENT_SIGNAL_MAX_TURN_CHARS = 4000
+    _AMBIENT_SIGNAL_MAX_ITERATIONS = 12
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -576,6 +581,263 @@ class GatewayRunner:
             return _find_skill("hermes-agent-setup") is not None
         except Exception:
             return False
+
+    # -- Ambient GBrain signal detector ---------------------------------
+
+    @staticmethod
+    def _truncate_ambient_signal_text(text: Any, limit: int) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: limit - 3].rstrip() + "..."
+
+    def _ambient_signal_detector_enabled(self, source: SessionSource) -> bool:
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+
+        signal_skill = _hermes_home / "skills" / "gbrain" / "signal-detector" / "SKILL.md"
+        brain_ops_skill = _hermes_home / "skills" / "gbrain" / "brain-ops" / "SKILL.md"
+        if not signal_skill.exists() or not brain_ops_skill.exists():
+            return False
+
+        try:
+            from hermes_cli.tools_config import _get_platform_tools
+
+            enabled_toolsets = _get_platform_tools(
+                _load_gateway_config(),
+                _platform_config_key(source.platform),
+            )
+        except Exception as exc:
+            logger.debug("Ambient signal detector toolset check failed: %s", exc)
+            return False
+
+        return "gbrain" in enabled_toolsets
+
+    def _is_purely_operational_signal_turn(self, message: str) -> bool:
+        text = re.sub(r"^\[[^\]]+\]\s*", "", (message or "").strip())
+        normalized = re.sub(r"\s+", " ", text).strip().lower()
+        if not normalized:
+            return True
+        if re.fullmatch(r"[^a-z0-9]+", normalized):
+            return True
+
+        trivial_turns = {
+            "k", "kk", "ok", "okay", "thanks", "thank you", "thx",
+            "got it", "noted", "done", "cool", "sg", "sounds good",
+            "yes", "no", "y", "n", "👍", "👌", "🙏", "✅",
+        }
+        return normalized in trivial_turns
+
+    def _render_ambient_signal_history(self, history: List[Dict[str, Any]]) -> str:
+        lines: List[str] = []
+        for msg in history or []:
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = self._truncate_ambient_signal_text(
+                msg.get("content", ""),
+                self._AMBIENT_SIGNAL_MAX_HISTORY_CHARS,
+            )
+            if content:
+                lines.append(f"{role}: {content}")
+        if not lines:
+            return "(no recent conversation history)"
+        return "\n".join(lines[-self._AMBIENT_SIGNAL_MAX_HISTORY:])
+
+    def _build_ambient_signal_prompt(
+        self,
+        *,
+        message: str,
+        history: List[Dict[str, Any]],
+        source: SessionSource,
+        session_id: str,
+        session_key: Optional[str],
+    ) -> str:
+        recent_history = self._render_ambient_signal_history(history)
+        current_turn = self._truncate_ambient_signal_text(
+            message,
+            self._AMBIENT_SIGNAL_MAX_TURN_CHARS,
+        )
+
+        metadata_lines = [
+            f"- platform: {source.platform.value if source.platform else 'unknown'}",
+            f"- chat_type: {getattr(source, 'chat_type', 'unknown')}",
+            f"- user_id: {source.user_id or 'unknown'}",
+        ]
+        if source.user_name:
+            metadata_lines.append(f"- user_name: {source.user_name}")
+        if session_id:
+            metadata_lines.append(f"- session_id: {session_id}")
+        if session_key:
+            metadata_lines.append(f"- session_key: {session_key}")
+        if getattr(source, "thread_id", None):
+            metadata_lines.append(f"- thread_id: {source.thread_id}")
+
+        metadata_block = "\n".join(metadata_lines)
+        return (
+            "You are Hermes' ambient GBrain signal-detector sidecar.\n"
+            "This task runs in parallel to the main Discord reply and must never block or send a user-visible message.\n"
+            "Load and follow the `signal-detector` and `brain-ops` skills before acting.\n"
+            "Use only the available GBrain + skills tools, especially the `mcp_gbrain_*` tools.\n"
+            "Do not use messaging, cron, terminal, browser, web, or unrelated MCP surfaces.\n"
+            "If this turn is purely operational or there is no durable signal worth writing, reply with exactly `[SILENT]`.\n"
+            "If you do capture anything, perform the required GBrain writes and then reply with exactly one line starting `Signals:` summarizing what you captured.\n"
+            "Preserve the user's exact phrasing for original thinking and maintain Iron-Law back-links for people/company mentions.\n\n"
+            "Session metadata:\n"
+            f"{metadata_block}\n\n"
+            "Recent conversation window:\n"
+            f"{recent_history}\n\n"
+            "Current inbound turn:\n"
+            f"{current_turn}\n"
+        )
+
+    def _schedule_ambient_signal_detector(
+        self,
+        *,
+        message: str,
+        history: List[Dict[str, Any]],
+        source: SessionSource,
+        session_id: str,
+        session_key: Optional[str],
+    ) -> None:
+        if not self._ambient_signal_detector_enabled(source):
+            return
+        if self._is_purely_operational_signal_turn(message):
+            logger.debug(
+                "Ambient signal detector skipped trivial turn for %s",
+                (session_key or session_id or source.chat_id or "unknown")[:80],
+            )
+            return
+
+        prompt = self._build_ambient_signal_prompt(
+            message=message,
+            history=history,
+            source=source,
+            session_id=session_id,
+            session_key=session_key,
+        )
+        task_id = f"ambient_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        task = asyncio.create_task(
+            self._run_ambient_signal_detector(
+                prompt=prompt,
+                source=source,
+                session_id=session_id,
+                session_key=session_key or "",
+                task_id=task_id,
+            )
+        )
+
+        bg_tasks = getattr(self, "_background_tasks", None)
+        if not isinstance(bg_tasks, set):
+            self._background_tasks = set()
+            bg_tasks = self._background_tasks
+
+        try:
+            bg_tasks.add(task)
+        except TypeError:
+            return
+
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(bg_tasks.discard)
+
+        logger.info(
+            "Ambient signal detector scheduled: task=%s session=%s",
+            task_id,
+            (session_key or session_id or source.chat_id or "unknown")[:80],
+        )
+
+    async def _run_ambient_signal_detector(
+        self,
+        *,
+        prompt: str,
+        source: SessionSource,
+        session_id: str,
+        session_key: str,
+        task_id: str,
+    ) -> None:
+        from run_agent import AIAgent
+
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except Exception as exc:
+            logger.warning("Ambient signal detector skipped (%s): %s", task_id, exc)
+            return
+
+        if not runtime_kwargs.get("api_key"):
+            logger.debug("Ambient signal detector skipped (%s): no provider credentials", task_id)
+            return
+
+        user_config = _load_gateway_config()
+        model = _resolve_gateway_model(user_config)
+        pr = getattr(self, "_provider_routing", {}) or {}
+        reasoning_config = self._load_reasoning_config()
+        turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+        platform_key = _platform_config_key(source.platform)
+        max_iterations = min(
+            int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+            self._AMBIENT_SIGNAL_MAX_ITERATIONS,
+        )
+
+        def run_sync():
+            agent = AIAgent(
+                model=turn_route["model"],
+                **turn_route["runtime"],
+                max_iterations=max_iterations,
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=list(self._AMBIENT_SIGNAL_TOOLSETS),
+                reasoning_config=reasoning_config,
+                providers_allowed=pr.get("only"),
+                providers_ignored=pr.get("ignore"),
+                providers_order=pr.get("order"),
+                provider_sort=pr.get("sort"),
+                provider_require_parameters=pr.get("require_parameters", False),
+                provider_data_collection=pr.get("data_collection"),
+                session_id=task_id,
+                parent_session_id=session_id,
+                platform=platform_key,
+                user_id=source.user_id,
+                fallback_model=self._fallback_model,
+                skip_memory=True,
+                persist_session=False,
+            )
+            return agent.run_conversation(user_message=prompt, task_id=task_id)
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, run_sync)
+        except Exception:
+            logger.exception(
+                "Ambient signal detector crashed: task=%s session=%s",
+                task_id,
+                (session_key or session_id or source.chat_id or "unknown")[:80],
+            )
+            return
+
+        if result and result.get("error"):
+            logger.warning(
+                "Ambient signal detector failed: task=%s session=%s error=%s",
+                task_id,
+                (session_key or session_id or source.chat_id or "unknown")[:80],
+                result.get("error"),
+            )
+            return
+
+        response = ((result or {}).get("final_response") or "").strip()
+        if not response or response == "[SILENT]":
+            logger.info(
+                "Ambient signal detector: no durable signal (task=%s session=%s)",
+                task_id,
+                (session_key or session_id or source.chat_id or "unknown")[:80],
+            )
+            return
+
+        summary = self._truncate_ambient_signal_text(response, 400)
+        logger.info(
+            "Ambient signal detector result: task=%s session=%s summary=%s",
+            task_id,
+            (session_key or session_id or source.chat_id or "unknown")[:80],
+            summary,
+        )
 
     # -- Voice mode persistence ------------------------------------------
 
@@ -2918,6 +3180,14 @@ class GatewayRunner:
                         message_text = _ctx_result.message
                 except Exception as exc:
                     logger.debug("@ context reference expansion failed: %s", exc)
+
+            self._schedule_ambient_signal_detector(
+                message=message_text,
+                history=history,
+                source=source,
+                session_id=session_entry.session_id,
+                session_key=session_key,
+            )
 
             # Run the agent
             agent_result = await self._run_agent(
