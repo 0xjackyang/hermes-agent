@@ -695,6 +695,20 @@ class TestCheckForSkillUpdates:
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
+    def test_bundle_content_hash_handles_binary_files(self):
+        bundle = SkillBundle(
+            name="demo-skill",
+            files={
+                "SKILL.md": "same content",
+                "assets/demo.bin": b"\x00\x01\x02binary",
+            },
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+        )
+
+        assert bundle_content_hash(bundle).startswith("sha256:")
+
     def test_reports_update_when_remote_hash_differs(self):
         lock = MagicMock()
         lock.list_installed.return_value = [{
@@ -1127,6 +1141,23 @@ class TestOptionalSkillSourceBinaryAssets:
         assert bundle.files["assets/neutts-cli/samples/jo.wav"] == wav_bytes
         assert bundle.files["assets/neutts-cli/samples/jo.txt"] == b"hello\n"
         assert "assets/neutts-cli/src/neutts_cli/__pycache__/cli.cpython-312.pyc" not in bundle.files
+
+    def test_fetch_prefers_frontmatter_name_over_directory_basename(self, tmp_path):
+        optional_root = tmp_path / "optional-skills"
+        skill_dir = optional_root / "devops" / "cli"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: inference-sh-cli\ndescription: official skill\n---\n\nBody\n",
+            encoding="utf-8",
+        )
+
+        src = OptionalSkillSource()
+        src._optional_dir = optional_root
+
+        bundle = src.fetch("official/devops/cli")
+
+        assert bundle is not None
+        assert bundle.name == "inference-sh-cli"
 
 
 class TestQuarantineBundleBinaryAssets:

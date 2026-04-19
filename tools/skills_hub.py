@@ -2182,8 +2182,24 @@ class OptionalSkillSource(SkillSource):
         if not files:
             return None
 
-        # Determine category from directory structure
+        # Prefer the canonical SKILL.md frontmatter name when present so
+        # installed lock/list/update state stays aligned with the actual skill
+        # identity instead of the repository directory basename.
         name = skill_dir.name
+        skill_md = files.get("SKILL.md")
+        skill_md_text = ""
+        if isinstance(skill_md, bytes):
+            try:
+                skill_md_text = skill_md.decode("utf-8")
+            except UnicodeDecodeError:
+                skill_md_text = ""
+        elif isinstance(skill_md, str):
+            skill_md_text = skill_md
+        if skill_md_text:
+            fm = self._parse_frontmatter(skill_md_text)
+            parsed_name = fm.get("name")
+            if isinstance(parsed_name, str) and parsed_name.strip():
+                name = parsed_name.strip()
 
         return SkillBundle(
             name=name,
@@ -2583,7 +2599,11 @@ def bundle_content_hash(bundle: SkillBundle) -> str:
     """Compute a deterministic hash for an in-memory skill bundle."""
     h = hashlib.sha256()
     for rel_path in sorted(bundle.files):
-        h.update(bundle.files[rel_path].encode("utf-8"))
+        payload = bundle.files[rel_path]
+        if isinstance(payload, bytes):
+            h.update(payload)
+        else:
+            h.update(str(payload).encode("utf-8"))
     return f"sha256:{h.hexdigest()[:16]}"
 
 
