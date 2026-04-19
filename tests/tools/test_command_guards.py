@@ -39,7 +39,16 @@ def _clean_state():
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
     saved = {}
-    for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE", "HERMES_CRON_JOB"):
+    for k in (
+        "HERMES_INTERACTIVE",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_EXEC_ASK",
+        "HERMES_YOLO_MODE",
+        "HERMES_CRON_JOB",
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_HOME",
+        "HERMES_GATEWAY_ROLLOUT_EXECUTOR",
+    ):
         if k in os.environ:
             saved[k] = os.environ.pop(k)
     yield
@@ -48,7 +57,16 @@ def _clean_state():
     approval_module._permanent_approved.clear()
     for k, v in saved.items():
         os.environ[k] = v
-    for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE", "HERMES_CRON_JOB"):
+    for k in (
+        "HERMES_INTERACTIVE",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_EXEC_ASK",
+        "HERMES_YOLO_MODE",
+        "HERMES_CRON_JOB",
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_HOME",
+        "HERMES_GATEWAY_ROLLOUT_EXECUTOR",
+    ):
         os.environ.pop(k, None)
 
 
@@ -175,6 +193,50 @@ class TestTirithAllowDangerous:
         assert result["approved"] is False
         assert result.get("status") == "approval_required"
         assert "restart hermes gateway service" in result["description"]
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_live_discord_self_gateway_restart_is_hard_blocked(self, mock_tirith):
+        os.environ["HERMES_SESSION_PLATFORM"] = "discord"
+        os.environ["HERMES_HOME"] = "/home/jackyujieyang/.hermes/profiles/satori-hermes"
+        result = check_all_command_guards(
+            "systemctl --user restart hermes-gateway-satori-hermes.service",
+            "local",
+        )
+        assert result["approved"] is False
+        assert result.get("status") == "blocked"
+        assert "bounded rollout executor" in result["message"].lower()
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_live_discord_self_gateway_stop_is_hard_blocked(self, mock_tirith):
+        os.environ["HERMES_SESSION_PLATFORM"] = "discord"
+        os.environ["HERMES_HOME"] = "/home/jackyujieyang/.hermes/profiles/satori-hermes"
+        result = check_all_command_guards(
+            "systemctl --user stop hermes-gateway-satori-hermes.service",
+            "local",
+        )
+        assert result["approved"] is False
+        assert result.get("status") == "blocked"
+        assert "do not stop or restart that same live gateway synchronously" in result["message"].lower()
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_live_discord_other_gateway_restart_only_needs_normal_approval(self, mock_tirith):
+        os.environ["HERMES_SESSION_PLATFORM"] = "discord"
+        os.environ["HERMES_HOME"] = "/home/jackyujieyang/.hermes/profiles/satori-hermes"
+        result = check_all_command_guards(
+            "systemctl --user restart hermes-gateway-leeno-hermes.service",
+            "local",
+        )
+        assert result["approved"] is False
+        assert result.get("status") == "approval_required"
+        assert "restart hermes gateway service" in result["description"]
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_live_discord_surface_uses_session_platform_for_other_dangerous_commands(self, mock_tirith):
+        os.environ["HERMES_SESSION_PLATFORM"] = "discord"
+        result = check_all_command_guards("rm -rf /tmp/demo", "local")
+        assert result["approved"] is False
+        assert result.get("status") == "approval_required"
+        assert result["description"] in {"recursive delete", "delete in root path"}
 
     def test_cron_gateway_restart_is_hard_blocked(self):
         os.environ["HERMES_CRON_JOB"] = "1"

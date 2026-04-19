@@ -11,6 +11,7 @@ This module is the single source of truth for the dangerous command system:
 import contextvars
 import logging
 import os
+from pathlib import Path
 import re
 import sys
 import threading
@@ -159,6 +160,49 @@ def _is_blocked_cron_gateway_restart(command: str) -> bool:
     normalized = _normalize_command_for_detection(command).lower()
     return bool(re.search(
         r'\bsystemctl\b[^\n]*\b(?:reload-or-restart|try-restart|restart)\b[^\n]*\bhermes-gateway(?:-[\w.-]+)?\.service\b',
+        normalized,
+        re.IGNORECASE | re.DOTALL,
+    ))
+
+
+def _is_live_messaging_surface() -> bool:
+    return bool(os.getenv("HERMES_GATEWAY_SESSION") or os.getenv("HERMES_SESSION_PLATFORM"))
+
+
+def _current_profile_gateway_unit() -> str:
+    hermes_home = os.getenv("HERMES_HOME", "").strip()
+    if not hermes_home:
+        return ""
+    slug = Path(hermes_home).name.strip()
+    if not slug:
+        return ""
+    return f"hermes-gateway-{slug}.service"
+
+
+def _bounded_gateway_executor_hint(unit: str) -> str:
+    configured = os.getenv("HERMES_GATEWAY_ROLLOUT_EXECUTOR", "").strip()
+    if configured:
+        return f"Use the bounded rollout executor: {configured} --service {unit} --scope user --reason <why>"
+    spark_executor = Path("/home/jackyujieyang/spark-ops/bin/guarded_gateway_rollout.py")
+    if spark_executor.exists():
+        return (
+            "Use the bounded rollout executor: "
+            f"python3 {spark_executor} --service {unit} --scope user --reason <why>"
+        )
+    return "Use a detached bounded rollout executor or staged handoff instead of direct systemctl stop/restart."
+
+
+def _is_live_self_gateway_interruption(command: str) -> bool:
+    if not _is_live_messaging_surface():
+        return False
+    current_unit = _current_profile_gateway_unit()
+    if not current_unit:
+        return False
+    normalized = _normalize_command_for_detection(command).lower()
+    if current_unit.lower() not in normalized:
+        return False
+    return bool(re.search(
+        r'\bsystemctl\b[^\n]*\b(?:stop|restart|reload-or-restart|try-restart)\b',
         normalized,
         re.IGNORECASE | re.DOTALL,
     ))
@@ -598,7 +642,7 @@ def check_dangerous_command(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
-    is_gateway = os.getenv("HERMES_GATEWAY_SESSION")
+    is_gateway = _is_live_messaging_surface()
 
     if not is_cli and not is_gateway:
         return {"approved": True, "message": None}
@@ -698,6 +742,21 @@ def check_all_command_guards(command: str, env_type: str,
             ),
         }
 
+    if _is_live_self_gateway_interruption(command):
+        current_unit = _current_profile_gateway_unit()
+        platform = (os.getenv("HERMES_SESSION_PLATFORM", "") or "gateway").strip().lower()
+        return {
+            "approved": False,
+            "status": "blocked",
+            "pattern_key": "restart hermes gateway service",
+            "description": "interrupt current hermes gateway service from live messaging turn",
+            "message": (
+                f"BLOCKED: This {platform} turn is running through {current_unit}. "
+                "Do not stop or restart that same live gateway synchronously. "
+                f"{_bounded_gateway_executor_hint(current_unit)}"
+            ),
+        }
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
@@ -705,7 +764,7 @@ def check_all_command_guards(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
-    is_gateway = os.getenv("HERMES_GATEWAY_SESSION")
+    is_gateway = _is_live_messaging_surface()
     is_ask = os.getenv("HERMES_EXEC_ASK")
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask

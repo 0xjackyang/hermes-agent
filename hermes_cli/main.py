@@ -3768,10 +3768,12 @@ def cmd_update(args):
                 find_gateway_pids,
                 _get_service_pids,
             )
+            from hermes_cli.gateway_rollout import run_bounded_gateway_rollout, resolve_bounded_gateway_rollout_executor
             import signal as _signal
 
             restarted_services = []
             killed_pids = set()
+            bounded_executor = resolve_bounded_gateway_rollout_executor()
 
             # --- Systemd services (Linux) ---
             # Discover all hermes-gateway* units (default + profiles)
@@ -3800,15 +3802,32 @@ def cmd_update(args):
                                 scope_cmd + ["is-active", svc_name],
                                 capture_output=True, text=True, timeout=5,
                             )
-                            if check.stdout.strip() == "active":
-                                restart = subprocess.run(
-                                    scope_cmd + ["restart", svc_name],
-                                    capture_output=True, text=True, timeout=15,
+                            if check.stdout.strip() != "active":
+                                continue
+                            if bounded_executor:
+                                bounded = run_bounded_gateway_rollout(
+                                    unit,
+                                    scope=scope,
+                                    reason="hermes update",
+                                    staged=bool(gateway_mode),
                                 )
-                                if restart.returncode == 0:
+                                if bounded.get("ok"):
                                     restarted_services.append(svc_name)
                                 else:
-                                    print(f"  ⚠ Failed to restart {svc_name}: {restart.stderr.strip()}")
+                                    print(
+                                        f"  ⚠ Failed bounded restart for {svc_name}: "
+                                        f"{bounded.get('summary') or bounded.get('stderr') or 'unknown error'}"
+                                    )
+                                continue
+
+                            restart = subprocess.run(
+                                scope_cmd + ["restart", svc_name],
+                                capture_output=True, text=True, timeout=15,
+                            )
+                            if restart.returncode == 0:
+                                restarted_services.append(svc_name)
+                            else:
+                                print(f"  ⚠ Failed to restart {svc_name}: {restart.stderr.strip()}")
                     except (FileNotFoundError, subprocess.TimeoutExpired):
                         pass
 
