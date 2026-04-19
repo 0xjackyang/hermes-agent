@@ -39,6 +39,44 @@ from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
+_JOB_EXECUTOR_CLASS = concurrent.futures.ProcessPoolExecutor
+
+
+def _shutdown_worker_mcp_servers() -> None:
+    """Best-effort MCP cleanup for cron subprocess workers.
+
+    Multi-job cron ticks use ``ProcessPoolExecutor``. Each worker imports
+    ``run_agent`` / ``model_tools``, which auto-discovers MCP servers and can
+    spawn stdio child processes. We cannot rely on interpreter shutdown hooks
+    alone to reap those children, so workers explicitly close MCP connections
+    before returning their result.
+    """
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+
+        shutdown_mcp_servers()
+    except Exception as exc:
+        logger.debug("Cron worker MCP cleanup skipped/failed: %s", exc)
+
+
+def _run_job_in_process_worker(job: dict):
+    """Run a cron job inside a subprocess worker and always clean MCP state."""
+    try:
+        return run_job(job)
+    finally:
+        _shutdown_worker_mcp_servers()
+
+
+def _job_runner_for_executor(executor_cls):
+    """Return the correct job runner for the configured executor class."""
+    try:
+        if issubclass(executor_cls, concurrent.futures.ProcessPoolExecutor):
+            return _run_job_in_process_worker
+    except TypeError:
+        if executor_cls is concurrent.futures.ProcessPoolExecutor:
+            return _run_job_in_process_worker
+    return run_job
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -868,6 +906,39 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
+def _finalize_completed_job(
+    job: dict,
+    success: bool,
+    output: str,
+    final_response: str,
+    error: Optional[str],
+    *,
+    verbose: bool,
+    adapters=None,
+    loop=None,
+) -> None:
+    """Persist output, deliver any user-facing result, and mark completion."""
+    output_file = save_job_output(job["id"], output)
+    if verbose:
+        logger.info("Output saved to: %s", output_file)
+
+    deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+    should_deliver = bool(deliver_content)
+    if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+        should_deliver = False
+
+    delivery_error = None
+    if should_deliver:
+        try:
+            delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+        except Exception as de:
+            delivery_error = str(de)
+            logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+    mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+
+
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
@@ -910,11 +981,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
         executed = 0
+
+        # For recurring jobs (cron/interval), advance next_run_at to the next
+        # future occurrence BEFORE execution so a mid-run crash will not re-fire
+        # them on restart. One-shot jobs are claimed before execution so they
+        # cannot be dispatched twice if the process dies before completion is
+        # persisted.
+        runnable_jobs = []
         for job in due_jobs:
             try:
-                # Claim one-shot jobs BEFORE execution so they cannot re-fire if
-                # the process dies before mark_job_run() persists completion.
-                # Recurring jobs keep the prior pre-advance behavior.
                 if job.get("schedule", {}).get("kind") == "once":
                     claimed = mark_job_started(job["id"])
                     if not claimed:
@@ -924,35 +999,59 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 else:
                     advance_next_run(job["id"])
 
+                runnable_jobs.append(job)
+            except Exception as e:
+                logger.error("Failed to advance next_run_at for job %s: %s", job['id'], e)
+                mark_job_run(job["id"], False, str(e))
+
+        if not runnable_jobs:
+            return executed
+
+        if len(runnable_jobs) == 1:
+            job = runnable_jobs[0]
+            try:
                 success, output, final_response, error = run_job(job)
-
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
-
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                _finalize_completed_job(
+                    job,
+                    success,
+                    output,
+                    final_response,
+                    error,
+                    verbose=verbose,
+                    adapters=adapters,
+                    loop=loop,
+                )
                 executed += 1
-
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
+            return executed
+
+        max_workers = max(1, min(len(runnable_jobs), os.cpu_count() or len(runnable_jobs)))
+        worker_target = _job_runner_for_executor(_JOB_EXECUTOR_CLASS)
+        with _JOB_EXECUTOR_CLASS(max_workers=max_workers) as pool:
+            future_to_job = {
+                pool.submit(worker_target, job): job
+                for job in runnable_jobs
+            }
+            for future in concurrent.futures.as_completed(future_to_job):
+                job = future_to_job[future]
+                try:
+                    success, output, final_response, error = future.result()
+                    _finalize_completed_job(
+                        job,
+                        success,
+                        output,
+                        final_response,
+                        error,
+                        verbose=verbose,
+                        adapters=adapters,
+                        loop=loop,
+                    )
+                    executed += 1
+                except Exception as e:
+                    logger.error("Error processing job %s: %s", job['id'], e)
+                    mark_job_run(job["id"], False, str(e))
 
         return executed
     finally:

@@ -1,0 +1,26 @@
+version: 1
+repo: hermes
+role: harness runtime and prompt/tool router
+wave: 2
+write_mode: read_only_until_explicit_approval
+default_verify_mode: live
+verify_commands:
+  fast: ./ops/verify fast --json
+  standard: ./ops/verify standard --json
+  live: ./ops/verify live --json
+branch_prefix: lane/hermes
+merge_policy: explicit_human_before_merge
+approvals: [prompt, runtime, gateway]
+risky_paths:
+  - AGENTS.md
+  - run_agent.py
+  - agent/**
+  - gateway/**
+  - tools/**
+  - tests/**
+generated_artifacts:
+  - __pycache__/
+  - .pytest_cache/
+  - build/
+  - dist/
+rollback_hint: Hermes changes must stay packetized and branch-only until explicit human approval to merge.
