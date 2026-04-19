@@ -41,6 +41,42 @@ logger = logging.getLogger(__name__)
 
 _JOB_EXECUTOR_CLASS = concurrent.futures.ProcessPoolExecutor
 
+
+def _shutdown_worker_mcp_servers() -> None:
+    """Best-effort MCP cleanup for cron subprocess workers.
+
+    Multi-job cron ticks use ``ProcessPoolExecutor``. Each worker imports
+    ``run_agent`` / ``model_tools``, which auto-discovers MCP servers and can
+    spawn stdio child processes. We cannot rely on interpreter shutdown hooks
+    alone to reap those children, so workers explicitly close MCP connections
+    before returning their result.
+    """
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+
+        shutdown_mcp_servers()
+    except Exception as exc:
+        logger.debug("Cron worker MCP cleanup skipped/failed: %s", exc)
+
+
+def _run_job_in_process_worker(job: dict):
+    """Run a cron job inside a subprocess worker and always clean MCP state."""
+    try:
+        return run_job(job)
+    finally:
+        _shutdown_worker_mcp_servers()
+
+
+def _job_runner_for_executor(executor_cls):
+    """Return the correct job runner for the configured executor class."""
+    try:
+        if issubclass(executor_cls, concurrent.futures.ProcessPoolExecutor):
+            return _run_job_in_process_worker
+    except TypeError:
+        if executor_cls is concurrent.futures.ProcessPoolExecutor:
+            return _run_job_in_process_worker
+    return run_job
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -981,9 +1017,10 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             return executed
 
         max_workers = max(1, min(len(runnable_jobs), os.cpu_count() or len(runnable_jobs)))
+        worker_target = _job_runner_for_executor(_JOB_EXECUTOR_CLASS)
         with _JOB_EXECUTOR_CLASS(max_workers=max_workers) as pool:
             future_to_job = {
-                pool.submit(run_job, job): job
+                pool.submit(worker_target, job): job
                 for job in runnable_jobs
             }
             for future in concurrent.futures.as_completed(future_to_job):
