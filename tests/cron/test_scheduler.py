@@ -976,10 +976,13 @@ class TestSilentDelivery:
             "name": "monitor",
             "deliver": "origin",
             "origin": {"platform": "telegram", "chat_id": "123"},
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
         }
 
-    def test_normal_response_delivers(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+    def test_normal_response_delivers(self, tmp_path):
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "Results here", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -988,8 +991,10 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_called_once()
 
-    def test_silent_response_suppresses_delivery(self, caplog):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+    def test_silent_response_suppresses_delivery(self, caplog, tmp_path):
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1000,8 +1005,10 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
-    def test_silent_with_note_suppresses_delivery(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+    def test_silent_with_note_suppresses_delivery(self, tmp_path):
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1010,10 +1017,12 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
-    def test_silent_trailing_suppresses_delivery(self):
+    def test_silent_trailing_suppresses_delivery(self, tmp_path):
         """Agent appended [SILENT] after explanation text — must still suppress."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1022,8 +1031,10 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
-    def test_silent_is_case_insensitive(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+    def test_silent_is_case_insensitive(self, tmp_path):
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1032,9 +1043,11 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
-    def test_failed_job_always_delivers(self):
+    def test_failed_job_always_delivers(self, tmp_path):
         """Failed jobs deliver regardless of [SILENT] in output."""
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1043,8 +1056,10 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_called_once()
 
-    def test_output_saved_even_when_delivery_suppressed(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+    def test_output_saved_even_when_delivery_suppressed(self, tmp_path):
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output") as save_mock, \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -1150,7 +1165,9 @@ class TestTickAdvanceBeforeRun:
             "schedule": {"kind": "cron", "expr": "15 6 * * *"},
         }
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
              patch("cron.scheduler.advance_next_run", side_effect=fake_advance) as adv_mock, \
              patch("cron.scheduler.run_job", side_effect=fake_run_job), \
              patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
@@ -1199,7 +1216,9 @@ class TestTickConcurrentDueJobs:
             {"id": "job-b", "name": "B", "prompt": "b", "enabled": True, "schedule": {"kind": "cron", "expr": "0 9 * * *"}},
         ]
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_run", side_effect=fake_advance), \
              patch("cron.scheduler.run_job", side_effect=fake_run_job), \
              patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
@@ -1222,7 +1241,9 @@ class TestTickConcurrentDueJobs:
             def __init__(self, *args, **kwargs):
                 raise AssertionError("executor path should not be used for one due job")
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
              patch("cron.scheduler.advance_next_run", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "output", "response", None)) as run_job_mock, \
              patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \

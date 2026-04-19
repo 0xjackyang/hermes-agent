@@ -1471,6 +1471,10 @@ class GatewayRunner:
         logger.info("Stopping gateway...")
         self._running = False
 
+        cron_stop_event = getattr(self, "_cron_stop_event", None)
+        if cron_stop_event is not None:
+            cron_stop_event.set()
+
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
@@ -7722,19 +7726,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         daemon=True,
         name="cron-ticker",
     )
+    runner._cron_stop_event = cron_stop
+    runner._cron_thread = cron_thread
     cron_thread.start()
     
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
+    # Stop cron ticker cleanly as soon as shutdown is requested, regardless of
+    # whether the gateway is exiting successfully or with failure.
+    cron_stop.set()
+    cron_thread.join(timeout=5)
+
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
-    # Stop cron ticker cleanly
-    cron_stop.set()
-    cron_thread.join(timeout=5)
 
     # Close MCP server connections
     try:

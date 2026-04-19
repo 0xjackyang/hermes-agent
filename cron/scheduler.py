@@ -85,7 +85,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "wecom", "sms", "email", "webhook", "bluebubbles",
 })
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, mark_job_started
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -622,6 +622,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     try:
         # Inject origin context so the agent's send_message tool knows the chat.
         # Must be INSIDE the try block so the finally cleanup always runs.
+        os.environ["HERMES_CRON_JOB"] = "1"
         if origin:
             os.environ["HERMES_SESSION_PLATFORM"] = origin["platform"]
             os.environ["HERMES_SESSION_CHAT_ID"] = str(origin["chat_id"])
@@ -885,6 +886,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     finally:
         # Clean up injected env vars so they don't leak to other jobs
         for key in (
+            "HERMES_CRON_JOB",
             "HERMES_SESSION_PLATFORM",
             "HERMES_SESSION_CHAT_ID",
             "HERMES_SESSION_CHAT_NAME",
@@ -981,13 +983,22 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         executed = 0
 
         # For recurring jobs (cron/interval), advance next_run_at to the next
-        # future occurrence BEFORE execution.  This way, if the process crashes
-        # mid-run, the job won't re-fire on restart.  One-shot jobs are left
-        # alone so they can retry on restart.
+        # future occurrence BEFORE execution so a mid-run crash will not re-fire
+        # them on restart. One-shot jobs are claimed before execution so they
+        # cannot be dispatched twice if the process dies before completion is
+        # persisted.
         runnable_jobs = []
         for job in due_jobs:
             try:
-                advance_next_run(job["id"])
+                if job.get("schedule", {}).get("kind") == "once":
+                    claimed = mark_job_started(job["id"])
+                    if not claimed:
+                        logger.info("Job '%s' could not be claimed for execution; skipping", job["id"])
+                        continue
+                    job = claimed
+                else:
+                    advance_next_run(job["id"])
+
                 runnable_jobs.append(job)
             except Exception as e:
                 logger.error("Failed to advance next_run_at for job %s: %s", job['id'], e)

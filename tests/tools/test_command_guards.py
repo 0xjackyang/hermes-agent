@@ -39,7 +39,7 @@ def _clean_state():
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
     saved = {}
-    for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE"):
+    for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE", "HERMES_CRON_JOB"):
         if k in os.environ:
             saved[k] = os.environ.pop(k)
     yield
@@ -48,7 +48,7 @@ def _clean_state():
     approval_module._permanent_approved.clear()
     for k, v in saved.items():
         os.environ[k] = v
-    for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE"):
+    for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE", "HERMES_CRON_JOB"):
         os.environ.pop(k, None)
 
 
@@ -164,6 +164,27 @@ class TestTirithAllowDangerous:
         cb.assert_called_once()
         # allow_permanent should be True (no tirith warning)
         assert cb.call_args[1]["allow_permanent"] is True
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_gateway_restart_requires_approval_outside_cron(self, mock_tirith):
+        os.environ["HERMES_GATEWAY_SESSION"] = "1"
+        result = check_all_command_guards(
+            "systemctl --user restart hermes-gateway-satori-hermes.service",
+            "local",
+        )
+        assert result["approved"] is False
+        assert result.get("status") == "approval_required"
+        assert "restart hermes gateway service" in result["description"]
+
+    def test_cron_gateway_restart_is_hard_blocked(self):
+        os.environ["HERMES_CRON_JOB"] = "1"
+        result = check_all_command_guards(
+            "systemctl --user restart hermes-gateway-satori-hermes.service",
+            "local",
+        )
+        assert result["approved"] is False
+        assert result.get("status") == "blocked"
+        assert "Cron jobs may not restart Hermes gateway services" in result["message"]
 
 
 # ---------------------------------------------------------------------------

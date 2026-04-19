@@ -164,6 +164,9 @@ def _build_runtime_status_record() -> dict[str, Any]:
     return payload
 
 
+_UNSET = object()
+
+
 def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
     if not path.exists():
         return None
@@ -217,11 +220,11 @@ def write_pid_file() -> None:
 def write_runtime_status(
     *,
     gateway_state: Optional[str] = None,
-    exit_reason: Optional[str] = None,
+    exit_reason: Any = _UNSET,
     platform: Optional[str] = None,
     platform_state: Optional[str] = None,
-    error_code: Optional[str] = None,
-    error_message: Optional[str] = None,
+    error_code: Any = _UNSET,
+    error_message: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -234,16 +237,16 @@ def write_runtime_status(
 
     if gateway_state is not None:
         payload["gateway_state"] = gateway_state
-    if exit_reason is not None:
+    if exit_reason is not _UNSET:
         payload["exit_reason"] = exit_reason
 
     if platform is not None:
         platform_payload = payload["platforms"].get(platform, {})
         if platform_state is not None:
             platform_payload["state"] = platform_state
-        if error_code is not None:
+        if error_code is not _UNSET:
             platform_payload["error_code"] = error_code
-        if error_message is not None:
+        if error_message is not _UNSET:
             platform_payload["error_message"] = error_message
         platform_payload["updated_at"] = _utc_now_iso()
         payload["platforms"][platform] = platform_payload
