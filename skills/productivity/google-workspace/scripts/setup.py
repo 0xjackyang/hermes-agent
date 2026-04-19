@@ -28,6 +28,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 try:
     from hermes_constants import display_hermes_home, get_hermes_home
 except ModuleNotFoundError:
@@ -36,10 +40,13 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(HERMES_AGENT_ROOT))
     from hermes_constants import display_hermes_home, get_hermes_home
 
+from google_account_registry import GoogleAccountSelection, resolve_google_account_selection
+
 HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
+ACTIVE_SELECTION: GoogleAccountSelection | None = None
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -47,6 +54,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/contacts.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/documents.readonly",
@@ -58,6 +66,37 @@ REQUIRED_PACKAGES = ["google-api-python-client", "google-auth-oauthlib", "google
 # Google deprecated OOB, so we use a localhost redirect and tell the user to
 # copy the code from the browser's URL bar (or the page body).
 REDIRECT_URI = "http://localhost:1"
+
+
+def configure_selection(account: str = "", route: str = "") -> GoogleAccountSelection:
+    global ACTIVE_SELECTION, TOKEN_PATH, CLIENT_SECRET_PATH, PENDING_AUTH_PATH
+
+    try:
+        ACTIVE_SELECTION = resolve_google_account_selection(account=account, route=route)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    TOKEN_PATH = ACTIVE_SELECTION.token_path
+    CLIENT_SECRET_PATH = ACTIVE_SELECTION.client_secret_path
+    PENDING_AUTH_PATH = ACTIVE_SELECTION.pending_auth_path
+    return ACTIVE_SELECTION
+
+
+def _active_selection() -> GoogleAccountSelection:
+    if ACTIVE_SELECTION is None:
+        return configure_selection()
+    return ACTIVE_SELECTION
+
+
+def _selection_summary(selection: GoogleAccountSelection) -> str:
+    alias = selection.alias or "legacy"
+    route = selection.route or "-"
+    email = selection.email or "-"
+    return (
+        f"alias={alias} route={route} source={selection.selection_source} "
+        f"expected_email={email} token={selection.token_path}"
+    )
 
 
 def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
@@ -120,6 +159,8 @@ def _ensure_deps():
 
 def check_auth():
     """Check if stored credentials are valid. Prints status, exits 0 or 1."""
+    selection = _active_selection()
+    print(f"ACCOUNT_CONTEXT: {_selection_summary(selection)}")
     if not TOKEN_PATH.exists():
         print(f"NOT_AUTHENTICATED: No token at {TOKEN_PATH}")
         return False
@@ -185,12 +226,14 @@ def store_client_secret(path: str):
         print("Download the correct file from: https://console.cloud.google.com/apis/credentials")
         sys.exit(1)
 
+    CLIENT_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
     CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2))
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
 def _save_pending_auth(*, state: str, code_verifier: str):
     """Persist the OAuth session bits needed for a later token exchange."""
+    PENDING_AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
     PENDING_AUTH_PATH.write_text(
         json.dumps(
             {
@@ -330,10 +373,13 @@ def exchange_auth_code(code: str):
         print(f"WARNING: Token missing some Google Workspace scopes: {', '.join(missing_scopes)}")
         print("Some services may not be available.")
 
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_PATH.write_text(json.dumps(token_payload, indent=2))
     PENDING_AUTH_PATH.unlink(missing_ok=True)
     print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
-    print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
+    print(f"Resolved token location: {TOKEN_PATH}")
+    if TOKEN_PATH == (HERMES_HOME / 'google_token.json'):
+        print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
 
 
 def revoke():
@@ -370,6 +416,8 @@ def revoke():
 
 def main():
     parser = argparse.ArgumentParser(description="Google Workspace OAuth setup for Hermes")
+    parser.add_argument("--account", default="", help="Named Google account alias from google_accounts.json")
+    parser.add_argument("--route", default="", help="Named Google account route from google_accounts.json")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true", help="Check if auth is valid (exit 0=yes, 1=no)")
     group.add_argument("--client-secret", metavar="PATH", help="Store OAuth client_secret.json")
@@ -378,6 +426,8 @@ def main():
     group.add_argument("--revoke", action="store_true", help="Revoke and delete stored token")
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
     args = parser.parse_args()
+
+    configure_selection(account=args.account, route=args.route)
 
     if args.check:
         sys.exit(0 if check_auth() else 1)

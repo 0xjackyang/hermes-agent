@@ -21,6 +21,10 @@ API_PATH = (
     Path(__file__).resolve().parents[2]
     / "skills/productivity/google-workspace/scripts/google_api.py"
 )
+REGISTRY_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "skills/productivity/google-workspace/scripts/google_account_registry.py"
+)
 
 
 @pytest.fixture
@@ -45,6 +49,20 @@ def api_module(monkeypatch, tmp_path):
     spec = importlib.util.spec_from_file_location("gws_api_test", API_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def registry_module(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    spec = importlib.util.spec_from_file_location("gws_registry_test", REGISTRY_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -173,3 +191,52 @@ def test_api_calendar_list_respects_date_range(api_module):
     params = json.loads(gws_args[params_idx + 1])
     assert params["timeMin"] == "2026-04-01T00:00:00Z"
     assert params["timeMax"] == "2026-04-07T23:59:59Z"
+
+
+def test_bridge_main_accepts_account_flag_and_strips_it_from_gws_args(bridge_module, tmp_path):
+    registry = {
+        "accounts": {
+            "jack-electrum": {
+                "token_path": "google-accounts/jack-electrum.json",
+                "client_secret_path": "google_client_secret.json",
+            }
+        }
+    }
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    (hermes_home / "google_accounts.json").write_text(json.dumps(registry))
+    token_path = hermes_home / "google-accounts/jack-electrum.json"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _write_token(token_path, token="ya29.alias", expiry=future)
+
+    captured = {}
+
+    def capture_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env", {})
+        return MagicMock(returncode=0)
+
+    with patch.object(sys, "argv", ["gws_bridge.py", "--account", "jack-electrum", "gmail", "+triage"]):
+        with patch.object(subprocess, "run", side_effect=capture_run):
+            with pytest.raises(SystemExit):
+                bridge_module.main()
+
+    assert captured["cmd"] == ["gws", "gmail", "+triage"]
+    assert captured["env"]["GOOGLE_WORKSPACE_CLI_TOKEN"] == "ya29.alias"
+
+
+
+def test_api_main_forwards_account_to_bridge(api_module):
+    captured = {}
+
+    def capture_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return MagicMock(returncode=0)
+
+    with patch.object(sys, "argv", ["google_api.py", "--account", "jack-electrum", "sheets", "get", "sheet123", "Sheet1!A1:B2"]):
+        with patch.object(subprocess, "run", side_effect=capture_run):
+            with pytest.raises(SystemExit):
+                api_module.main()
+
+    assert captured["cmd"][:5] == [sys.executable, str(api_module.BRIDGE), "--account", "jack-electrum", "sheets"]
+    assert captured["cmd"][5:] == ["+read", "--spreadsheet", "sheet123", "--range", "Sheet1!A1:B2", "--format", "json"]

@@ -31,10 +31,23 @@ BRIDGE = Path(__file__).parent / "gws_bridge.py"
 PYTHON = sys.executable
 
 
-def gws(*args: str) -> None:
+def _selection_kwargs(args) -> dict:
+    return {
+        "account": getattr(args, "account", "") or "",
+        "route": getattr(args, "route", "") or "",
+    }
+
+
+def gws(*args: str, account: str = "", route: str = "") -> None:
     """Call gws via the bridge and exit with its return code."""
+    bridge_cmd = [PYTHON, str(BRIDGE)]
+    if account:
+        bridge_cmd += ["--account", account]
+    if route:
+        bridge_cmd += ["--route", route]
+    bridge_cmd += list(args)
     result = subprocess.run(
-        [PYTHON, str(BRIDGE)] + list(args),
+        bridge_cmd,
         env={**os.environ, "HERMES_HOME": os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))},
     )
     sys.exit(result.returncode)
@@ -44,10 +57,10 @@ def gws(*args: str) -> None:
 
 def gmail_search(args):
     cmd = ["gmail", "+triage", "--query", args.query, "--max", str(args.max), "--format", "json"]
-    gws(*cmd)
+    gws(*cmd, **_selection_kwargs(args))
 
 def gmail_get(args):
-    gws("gmail", "+read", "--id", args.message_id, "--headers", "--format", "json")
+    gws("gmail", "+read", "--id", args.message_id, "--headers", "--format", "json", **_selection_kwargs(args))
 
 def gmail_send(args):
     cmd = ["gmail", "+send", "--to", args.to, "--subject", args.subject, "--body", args.body, "--format", "json"]
@@ -55,13 +68,13 @@ def gmail_send(args):
         cmd += ["--cc", args.cc]
     if args.html:
         cmd.append("--html")
-    gws(*cmd)
+    gws(*cmd, **_selection_kwargs(args))
 
 def gmail_reply(args):
-    gws("gmail", "+reply", "--message-id", args.message_id, "--body", args.body, "--format", "json")
+    gws("gmail", "+reply", "--message-id", args.message_id, "--body", args.body, "--format", "json", **_selection_kwargs(args))
 
 def gmail_labels(args):
-    gws("gmail", "users", "labels", "list", "--params", json.dumps({"userId": "me"}), "--format", "json")
+    gws("gmail", "users", "labels", "list", "--params", json.dumps({"userId": "me"}), "--format", "json", **_selection_kwargs(args))
 
 def gmail_modify(args):
     body = {}
@@ -74,6 +87,7 @@ def gmail_modify(args):
         "--params", json.dumps({"userId": "me", "id": args.message_id}),
         "--json", json.dumps(body),
         "--format", "json",
+        **_selection_kwargs(args),
     )
 
 
@@ -97,13 +111,14 @@ def calendar_list(args):
                 "orderBy": "startTime",
             }),
             "--format", "json",
+            **_selection_kwargs(args),
         )
     else:
         # No date range — use +agenda helper (defaults to 7 days)
         cmd = ["calendar", "+agenda", "--days", "7", "--format", "json"]
         if args.calendar != "primary":
             cmd += ["--calendar", args.calendar]
-        gws(*cmd)
+        gws(*cmd, **_selection_kwargs(args))
 
 def calendar_create(args):
     cmd = [
@@ -122,13 +137,14 @@ def calendar_create(args):
             cmd += ["--attendee", email.strip()]
     if args.calendar != "primary":
         cmd += ["--calendar", args.calendar]
-    gws(*cmd)
+    gws(*cmd, **_selection_kwargs(args))
 
 def calendar_delete(args):
     gws(
         "calendar", "events", "delete",
         "--params", json.dumps({"calendarId": args.calendar, "eventId": args.event_id}),
         "--format", "json",
+        **_selection_kwargs(args),
     )
 
 
@@ -144,6 +160,7 @@ def drive_search(args):
             "fields": "files(id,name,mimeType,modifiedTime,webViewLink)",
         }),
         "--format", "json",
+        **_selection_kwargs(args),
     )
 
 
@@ -158,6 +175,7 @@ def contacts_list(args):
             "personFields": "names,emailAddresses,phoneNumbers",
         }),
         "--format", "json",
+        **_selection_kwargs(args),
     )
 
 
@@ -169,6 +187,7 @@ def sheets_get(args):
         "--spreadsheet", args.sheet_id,
         "--range", args.range,
         "--format", "json",
+        **_selection_kwargs(args),
     )
 
 def sheets_update(args):
@@ -182,6 +201,7 @@ def sheets_update(args):
         }),
         "--json", json.dumps({"values": values}),
         "--format", "json",
+        **_selection_kwargs(args),
     )
 
 def sheets_append(args):
@@ -191,6 +211,7 @@ def sheets_append(args):
         "--spreadsheet", args.sheet_id,
         "--json-values", json.dumps(values),
         "--format", "json",
+        **_selection_kwargs(args),
     )
 
 
@@ -201,6 +222,7 @@ def docs_get(args):
         "docs", "documents", "get",
         "--params", json.dumps({"documentId": args.doc_id}),
         "--format", "json",
+        **_selection_kwargs(args),
     )
 
 
@@ -208,6 +230,8 @@ def docs_get(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Google Workspace API for Hermes Agent (gws backend)")
+    parser.add_argument("--account", default="", help="Named Google account alias from google_accounts.json")
+    parser.add_argument("--route", default="", help="Named Google account route from google_accounts.json")
     sub = parser.add_subparsers(dest="service", required=True)
 
     # --- Gmail ---
