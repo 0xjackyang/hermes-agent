@@ -139,21 +139,19 @@ class TestSessionKeyContext:
         run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
         module = ast.parse(run_py.read_text(encoding="utf-8"))
 
-        run_sync = None
+        run_sync_calls = []
         for node in ast.walk(module):
             if isinstance(node, ast.FunctionDef) and node.name == "run_sync":
-                run_sync = node
-                break
+                called_names = {
+                    child.func.id
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                }
+                run_sync_calls.append(called_names)
 
-        assert run_sync is not None, "gateway.run.run_sync not found"
-
-        called_names = set()
-        for node in ast.walk(run_sync):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                called_names.add(node.func.id)
-
-        assert "set_current_session_key" in called_names
-        assert "reset_current_session_key" in called_names
+        assert run_sync_calls, "gateway.run.run_sync not found"
+        assert any("set_current_session_key" in names for names in run_sync_calls)
+        assert any("reset_current_session_key" in names for names in run_sync_calls)
 
 
 class TestRmFalsePositiveFix:
@@ -647,5 +645,4 @@ class TestNormalizationBypass:
         cmd = "\uff4c\uff53 -\uff4c\uff41 /tmp"
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
-
 
