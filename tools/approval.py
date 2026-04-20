@@ -184,6 +184,40 @@ def _normalize_command_for_detection(command: str) -> str:
     return command
 
 
+def _is_live_messaging_surface() -> bool:
+    from gateway.session_context import get_session_env
+
+    return bool(
+        os.getenv("HERMES_GATEWAY_SESSION")
+        or get_session_env("HERMES_SESSION_PLATFORM")
+    )
+
+
+def _current_gateway_unit() -> str:
+    from hermes_cli.gateway import get_service_name
+
+    service_name = (get_service_name() or "").strip()
+    if not service_name:
+        return ""
+    return f"{service_name}.service"
+
+
+def _is_live_self_gateway_interruption(command: str) -> bool:
+    if not _is_live_messaging_surface():
+        return False
+    current_unit = _current_gateway_unit()
+    if not current_unit:
+        return False
+    normalized = _normalize_command_for_detection(command).lower()
+    if current_unit.lower() not in normalized:
+        return False
+    return bool(re.search(
+        r'\bsystemctl\b[^\n]*\b(?:stop|restart|reload-or-restart|try-restart)\b',
+        normalized,
+        re.IGNORECASE | re.DOTALL,
+    ))
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -624,7 +658,7 @@ def check_dangerous_command(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
-    is_gateway = os.getenv("HERMES_GATEWAY_SESSION")
+    is_gateway = _is_live_messaging_surface()
 
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
@@ -731,8 +765,25 @@ def check_all_command_guards(command: str, env_type: str,
     if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
+    if _is_live_self_gateway_interruption(command):
+        from gateway.session_context import get_session_env
+
+        platform = (get_session_env("HERMES_SESSION_PLATFORM") or "gateway").strip().lower()
+        current_unit = _current_gateway_unit()
+        return {
+            "approved": False,
+            "status": "blocked",
+            "pattern_key": "stop/restart system service",
+            "description": "interrupt current hermes gateway service from live messaging turn",
+            "message": (
+                f"BLOCKED: This {platform} turn is running through {current_unit}. "
+                "Do not stop or restart that same live gateway synchronously. "
+                "Use a detached or staged handoff instead."
+            ),
+        }
+
     is_cli = os.getenv("HERMES_INTERACTIVE")
-    is_gateway = os.getenv("HERMES_GATEWAY_SESSION")
+    is_gateway = _is_live_messaging_surface()
     is_ask = os.getenv("HERMES_EXEC_ASK")
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
