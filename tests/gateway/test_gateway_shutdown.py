@@ -74,6 +74,7 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     runner._pending_messages = {"session": "pending text"}
     runner._pending_approvals = {"session": {"command": "rm -rf /tmp/x"}}
     runner._background_tasks = set()
+    runner._agent_executor_tasks = set()
     runner._cron_stop_event = threading.Event()
     runner._shutdown_all_gateway_honcho = lambda: None
 
@@ -107,4 +108,34 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     assert runner._pending_messages == {}
     assert runner._pending_approvals == {}
     assert runner._cron_stop_event.is_set() is True
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_drains_agent_executor_tasks():
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={})
+    runner._running = True
+    runner._shutdown_event = asyncio.Event()
+    runner._exit_reason = None
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._background_tasks = set()
+    runner._agent_executor_tasks = set()
+    runner._cron_stop_event = threading.Event()
+    runner._shutdown_all_gateway_honcho = lambda: None
+    runner.adapters = {}
+    runner._running_agents = {}
+
+    async def complete_later():
+        await asyncio.sleep(0.05)
+        return "done"
+
+    task = asyncio.create_task(complete_later())
+    runner._register_agent_executor_task(task)
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    assert task.done()
     assert runner._shutdown_event.is_set() is True

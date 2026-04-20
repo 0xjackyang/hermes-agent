@@ -681,7 +681,8 @@ class TestShutdown:
         from tools.mcp_tool import shutdown_mcp_servers, _servers
 
         _servers.clear()
-        shutdown_mcp_servers()  # Should not raise
+        result = shutdown_mcp_servers()  # Should not raise
+        assert result["server_count"] == 0
 
     def test_shutdown_clears_servers(self):
         """shutdown_mcp_servers calls shutdown() on each server and clears dict."""
@@ -696,13 +697,14 @@ class TestShutdown:
 
         mcp_mod._ensure_mcp_loop()
         try:
-            shutdown_mcp_servers()
+            result = shutdown_mcp_servers()
         finally:
             mcp_mod._mcp_loop = None
             mcp_mod._mcp_thread = None
 
         assert len(_servers) == 0
         mock_server.shutdown.assert_called_once()
+        assert result["server_count"] == 1
 
     def test_shutdown_handles_errors(self):
         """shutdown_mcp_servers handles errors during close gracefully."""
@@ -717,12 +719,14 @@ class TestShutdown:
 
         mcp_mod._ensure_mcp_loop()
         try:
-            shutdown_mcp_servers()  # Should not raise
+            result = shutdown_mcp_servers()  # Should not raise
         finally:
             mcp_mod._mcp_loop = None
             mcp_mod._mcp_thread = None
 
         assert len(_servers) == 0
+        assert result["server_count"] == 1
+        assert result["shutdown_timed_out"] is False
 
     def test_shutdown_is_parallel(self):
         """Multiple servers are shut down in parallel via asyncio.gather."""
@@ -753,6 +757,33 @@ class TestShutdown:
         assert len(_servers) == 0
         # Parallel: ~1s, not ~3s. Allow some margin.
         assert elapsed < 2.5, f"Shutdown took {elapsed:.1f}s, expected ~1s (parallel)"
+
+    def test_shutdown_returns_timeout_summary(self):
+        import tools.mcp_tool as mcp_mod
+        from tools.mcp_tool import shutdown_mcp_servers, _servers
+
+        _servers.clear()
+        mock_server = MagicMock()
+        mock_server.name = "slow"
+        mock_server.shutdown = AsyncMock()
+        _servers["slow"] = mock_server
+
+        mcp_mod._ensure_mcp_loop()
+        try:
+            with patch("tools.mcp_tool.asyncio.run_coroutine_threadsafe") as mock_rcts:
+                future = MagicMock()
+                future.result.side_effect = TimeoutError("boom")
+                def _fake_rcts(coro, loop):
+                    coro.close()
+                    return future
+                mock_rcts.side_effect = _fake_rcts
+                result = shutdown_mcp_servers()
+        finally:
+            mcp_mod._mcp_loop = None
+            mcp_mod._mcp_thread = None
+
+        assert result["shutdown_timed_out"] is True
+        assert result["server_count"] == 1
 
 
 # ---------------------------------------------------------------------------

@@ -2163,10 +2163,18 @@ def shutdown_mcp_servers():
     with _lock:
         servers_snapshot = list(_servers.values())
 
+    result = {
+        "server_count": len(servers_snapshot),
+        "shutdown_timed_out": False,
+        "thread_alive_after_join": False,
+        "orphaned_pids_killed": 0,
+        "errors": [],
+    }
+
     # Fast path: nothing to shut down.
     if not servers_snapshot:
-        _stop_mcp_loop()
-        return
+        result.update(_stop_mcp_loop())
+        return result
 
     async def _shutdown():
         results = await asyncio.gather(
@@ -2189,11 +2197,14 @@ def shutdown_mcp_servers():
             future.result(timeout=15)
         except Exception as exc:
             logger.debug("Error during MCP shutdown: %s", exc)
+            result["shutdown_timed_out"] = True
+            result["errors"].append(str(exc))
 
-    _stop_mcp_loop()
+    result.update(_stop_mcp_loop())
+    return result
 
 
-def _kill_orphaned_mcp_children() -> None:
+def _kill_orphaned_mcp_children() -> int:
     """Best-effort kill of MCP stdio subprocesses that survived loop shutdown.
 
     After the MCP event loop is stopped, stdio server subprocesses *should*
@@ -2208,17 +2219,21 @@ def _kill_orphaned_mcp_children() -> None:
         pids = list(_stdio_pids)
         _stdio_pids.clear()
 
+    killed = 0
     for pid in pids:
         try:
             os.kill(pid, _signal.SIGKILL)
             logger.debug("Force-killed orphaned MCP stdio process %d", pid)
+            killed += 1
         except (ProcessLookupError, PermissionError, OSError):
             pass  # Already exited or inaccessible
+    return killed
 
 
-def _stop_mcp_loop():
+def _stop_mcp_loop() -> dict[str, Any]:
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
+    result = {"thread_alive_after_join": False, "orphaned_pids_killed": 0}
     with _lock:
         loop = _mcp_loop
         thread = _mcp_thread
@@ -2228,13 +2243,15 @@ def _stop_mcp_loop():
         loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             thread.join(timeout=5)
+            result["thread_alive_after_join"] = thread.is_alive()
         try:
             loop.close()
         except Exception:
             pass
         # After closing the loop, any stdio subprocesses that survived the
         # graceful shutdown are now orphaned.  Force-kill them.
-        _kill_orphaned_mcp_children()
+        result["orphaned_pids_killed"] = _kill_orphaned_mcp_children()
+    return result
 
 
 def _shutdown_mcp_servers_atexit() -> None:

@@ -509,6 +509,7 @@ class GatewayRunner:
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
+        self._agent_executor_tasks: set[asyncio.Future] = set()
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -568,6 +569,38 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+    def _register_agent_executor_task(self, task: asyncio.Future) -> None:
+        tasks = getattr(self, "_agent_executor_tasks", None)
+        if tasks is None:
+            self._agent_executor_tasks = set()
+            tasks = self._agent_executor_tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _drain_agent_executor_tasks(self, timeout: float = 15.0) -> dict[str, Any]:
+        tasks = {
+            task for task in getattr(self, "_agent_executor_tasks", set())
+            if not task.done()
+        }
+        if not tasks:
+            return {"tracked": 0, "completed": 0, "pending": 0, "timed_out": False}
+
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        completed = len(done)
+        if pending:
+            for task in pending:
+                task.cancel()
+            done_after_cancel, still_pending = await asyncio.wait(pending, timeout=1.0)
+            completed += len(done_after_cancel)
+            pending = still_pending
+
+        return {
+            "tracked": len(tasks),
+            "completed": completed,
+            "pending": len(pending),
+            "timed_out": bool(pending),
+        }
 
 
 
@@ -1776,6 +1809,22 @@ class GatewayRunner:
             _task.cancel()
         self._background_tasks.clear()
 
+        drain_result = await self._drain_agent_executor_tasks(timeout=15.0)
+        if drain_result["timed_out"]:
+            logger.warning(
+                "Gateway shutdown executor drain timed out: tracked=%s completed=%s pending=%s",
+                drain_result["tracked"],
+                drain_result["completed"],
+                drain_result["pending"],
+            )
+        else:
+            logger.info(
+                "Gateway shutdown executor drain complete: tracked=%s completed=%s pending=%s",
+                drain_result["tracked"],
+                drain_result["completed"],
+                drain_result["pending"],
+            )
+
         self.adapters.clear()
         self._running_agents.clear()
         self._pending_messages.clear()
@@ -1789,7 +1838,7 @@ class GatewayRunner:
         except Exception:
             pass
         
-        logger.info("Gateway stopped")
+        logger.info("Gateway stop requested complete; process teardown continuing")
     
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
@@ -7525,6 +7574,7 @@ class GatewayRunner:
             _executor_task = asyncio.ensure_future(
                 loop.run_in_executor(None, run_sync)
             )
+            self._register_agent_executor_task(_executor_task)
 
             _inactivity_timeout = False
             _POLL_INTERVAL = 5.0
@@ -8005,20 +8055,60 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Stop cron ticker cleanly as soon as shutdown is requested, regardless of
     # whether the gateway is exiting successfully or with failure.
+    logger.info("Gateway teardown: waiting for cron ticker to stop")
     cron_stop.set()
+    _cron_join_start = time.monotonic()
     cron_thread.join(timeout=5)
+    _cron_join_elapsed = time.monotonic() - _cron_join_start
+    if cron_thread.is_alive():
+        logger.warning(
+            "Gateway teardown: cron ticker still alive after %.2fs join timeout",
+            _cron_join_elapsed,
+        )
+    else:
+        logger.info("Gateway teardown: cron ticker joined in %.2fs", _cron_join_elapsed)
 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
 
+    logger.info("Gateway teardown: shutting down default executor")
+    _executor_shutdown_start = time.monotonic()
+    try:
+        shutdown_default_executor = getattr(asyncio.get_running_loop(), "shutdown_default_executor", None)
+        if shutdown_default_executor is not None:
+            try:
+                await shutdown_default_executor(timeout=5)
+            except TypeError:
+                await asyncio.wait_for(shutdown_default_executor(), timeout=5)
+    except Exception as exc:
+        logger.warning("Gateway teardown: default executor shutdown error: %s", exc)
+    else:
+        logger.info(
+            "Gateway teardown: default executor shutdown completed in %.2fs",
+            time.monotonic() - _executor_shutdown_start,
+        )
+
     # Close MCP server connections
+    logger.info("Gateway teardown: shutting down MCP servers")
+    _mcp_shutdown_start = time.monotonic()
     try:
         from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
+        mcp_result = shutdown_mcp_servers()
+    except Exception as exc:
+        logger.warning("Gateway teardown: MCP shutdown error: %s", exc)
+    else:
+        logger.info(
+            "Gateway teardown: MCP shutdown completed in %.2fs (servers=%s timed_out=%s thread_alive=%s orphan_kills=%s)",
+            time.monotonic() - _mcp_shutdown_start,
+            mcp_result.get("server_count"),
+            mcp_result.get("shutdown_timed_out"),
+            mcp_result.get("thread_alive_after_join"),
+            mcp_result.get("orphaned_pids_killed"),
+        )
+
+    logger.info("Gateway stopped")
 
     return True
 
