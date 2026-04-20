@@ -10,6 +10,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, SessionStore
+from gateway.turn_recovery import TurnRecoveryHandle
 
 
 class RecoveryAdapter(BasePlatformAdapter):
@@ -96,6 +97,56 @@ def test_session_store_persists_pending_recovery(tmp_path: Path):
     assert recoveries[0]["recovery"]["event"]["text"] == "hello"
 
 
+def test_turn_recovery_handle_stages_followup_resets_replay_count_for_new_turn(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    entry = store.get_or_create_session(source)
+    first_event = _event("hello")
+    followup_event = _event("follow up")
+
+    handle = TurnRecoveryHandle(
+        session_store=store,
+        session_key=entry.session_key,
+        session_id=entry.session_id,
+        source=source,
+        event=first_event,
+    )
+    handle.begin()
+    handle.mark_replayed()
+    handle.stage_followup(
+        session_id=entry.session_id,
+        source=source,
+        event=followup_event,
+    )
+
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["event"]["text"] == "follow up"
+    assert recovery["resume_attempts"] == 0
+
+
+def test_turn_recovery_handle_preserves_replay_count_for_same_turn(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    entry = store.get_or_create_session(source)
+    event = _event("resume me")
+
+    handle = TurnRecoveryHandle(
+        session_store=store,
+        session_key=entry.session_key,
+        session_id=entry.session_id,
+        source=source,
+        event=event,
+    )
+    handle.begin()
+    handle.mark_replayed()
+    handle.begin()
+
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["resume_attempts"] == 1
+
+
 @pytest.mark.asyncio
 async def test_gateway_replays_safe_pending_turn(tmp_path: Path):
     sessions_dir = tmp_path / "sessions"
@@ -134,6 +185,50 @@ async def test_gateway_replays_safe_pending_turn(tmp_path: Path):
     assert runner._running_agents == {}
     recovery = store.list_pending_recoveries()[0]["recovery"]
     assert recovery["resume_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_message_during_replay_is_queued_under_sentinel(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    replay_event = _event("resume me")
+    live_event = _event("new live message")
+    entry = store.get_or_create_session(source)
+
+    runner = _recovery_runner(store)
+    runner.config = _config()
+    runner._running = True
+    runner._pending_messages = {}
+    runner._background_tasks = set()
+    runner._agent_executor_tasks = set()
+    runner._cron_stop_event = threading.Event()
+    runner._shutdown_event = asyncio.Event()
+    runner._exit_reason = None
+    runner._session_model_overrides = {}
+    runner._failed_platforms = {}
+    runner._update_prompt_pending = {}
+    runner._session_db = None
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.pairing_store = MagicMock()
+    runner._is_user_authorized = lambda _source: True
+
+    adapter = RecoveryAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    async def fake_handle_message_with_agent(replay_msg, replay_source, quick_key):
+        assert runner._running_agents[quick_key] is _AGENT_PENDING_SENTINEL
+        result = await GatewayRunner._handle_message(runner, live_event)
+        assert result is None
+        assert adapter._pending_messages[quick_key] is live_event
+        return None
+
+    runner._handle_message_with_agent = fake_handle_message_with_agent
+
+    await runner._replay_pending_turn(entry.session_key, replay_event)
+
+    assert runner._running_agents == {}
 
 
 @pytest.mark.asyncio
@@ -365,10 +460,17 @@ async def test_gateway_stop_marks_tool_execution_unsafe(tmp_path: Path):
     runner._shutdown_all_gateway_honcho = lambda: None
     runner.adapters = {}
     fake_agent = MagicMock()
-    fake_agent.get_activity_summary.return_value = {
+    activity = {
         "current_tool": "terminal",
-        "last_activity_desc": "running tool terminal",
+        "last_activity_desc": "executing tool: terminal",
     }
+    fake_agent.get_activity_summary.side_effect = lambda: dict(activity)
+
+    def clear_activity(_reason):
+        activity["current_tool"] = None
+        activity["last_activity_desc"] = "waiting for provider response (streaming)"
+
+    fake_agent.interrupt.side_effect = clear_activity
     runner._running_agents = {entry.session_key: fake_agent}
 
     store.set_pending_recovery(
@@ -386,6 +488,53 @@ async def test_gateway_stop_marks_tool_execution_unsafe(tmp_path: Path):
     recovery = store.list_pending_recoveries()[0]["recovery"]
     assert recovery["unsafe_reason"] == "tool_execution_interrupted"
     assert "terminal" in recovery["summary"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_marks_post_tool_completion_unknown(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    event = _event("run tool")
+    entry = store.get_or_create_session(source)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = _config()
+    runner.session_store = store
+    runner._running = True
+    runner._shutdown_event = asyncio.Event()
+    runner._exit_reason = None
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._background_tasks = set()
+    runner._agent_executor_tasks = set()
+    runner._cron_stop_event = threading.Event()
+    runner._shutdown_all_gateway_honcho = lambda: None
+    runner.adapters = {}
+    runner._running_agents_ts = {}
+    runner._pending_approvals_lock = threading.Lock()
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {
+        "current_tool": None,
+        "last_activity_desc": "tool completed: write_file (0.2s)",
+    }
+    runner._running_agents = {entry.session_key: fake_agent}
+
+    store.set_pending_recovery(
+        entry.session_key,
+        GatewayRunner._build_turn_recovery_payload(
+            session_id=entry.session_id,
+            source=source,
+            event=event,
+        ),
+    )
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["unsafe_reason"] == "side_effect_boundary_unknown"
+    assert "tool completion" in recovery["summary"]
 
 
 @pytest.mark.asyncio

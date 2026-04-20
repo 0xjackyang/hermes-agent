@@ -234,6 +234,11 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
 )
+from gateway.turn_recovery import (
+    TurnRecoveryHandle,
+    build_turn_recovery_payload,
+    restore_recovery_event,
+)
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 
@@ -623,60 +628,15 @@ class GatewayRunner:
         source: SessionSource,
         event: MessageEvent,
     ) -> Dict[str, Any]:
-        return {
-            "session_id": session_id,
-            "source": source.to_dict(),
-            "event": {
-                "text": event.text,
-                "message_type": event.message_type.value if hasattr(event.message_type, "value") else str(event.message_type),
-                "message_id": event.message_id,
-                "media_urls": list(event.media_urls),
-                "media_types": list(event.media_types),
-                "reply_to_message_id": event.reply_to_message_id,
-                "reply_to_text": event.reply_to_text,
-                "auto_skill": event.auto_skill,
-                "internal": event.internal,
-                "timestamp": event.timestamp.isoformat() if getattr(event, "timestamp", None) else None,
-            },
-            "resume_safe": True,
-            "unsafe_reason": None,
-            "resume_attempts": 0,
-            "created_at": datetime.now().isoformat(),
-        }
+        return build_turn_recovery_payload(
+            session_id=session_id,
+            source=source,
+            event=event,
+        )
 
     @staticmethod
     def _restore_recovery_event(payload: Dict[str, Any]) -> Optional[MessageEvent]:
-        try:
-            source = SessionSource.from_dict(payload["source"])
-            event_data = payload["event"]
-        except Exception:
-            return None
-
-        message_type_raw = event_data.get("message_type", MessageType.TEXT.value)
-        try:
-            message_type = MessageType(message_type_raw)
-        except Exception:
-            message_type = MessageType.TEXT
-
-        timestamp_raw = event_data.get("timestamp")
-        try:
-            timestamp = datetime.fromisoformat(timestamp_raw) if timestamp_raw else datetime.now()
-        except Exception:
-            timestamp = datetime.now()
-
-        return MessageEvent(
-            text=event_data.get("text", ""),
-            message_type=message_type,
-            source=source,
-            message_id=event_data.get("message_id"),
-            media_urls=list(event_data.get("media_urls", [])),
-            media_types=list(event_data.get("media_types", [])),
-            reply_to_message_id=event_data.get("reply_to_message_id"),
-            reply_to_text=event_data.get("reply_to_text"),
-            auto_skill=event_data.get("auto_skill"),
-            internal=bool(event_data.get("internal", False)),
-            timestamp=timestamp,
-        )
+        return restore_recovery_event(payload)
 
     async def _recover_pending_turns(self, platforms: Optional[set[Platform]] = None) -> None:
         try:
@@ -775,7 +735,13 @@ class GatewayRunner:
         self._running_agents[session_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[session_key] = time.time()
         try:
-            self.session_store.mark_pending_recovery_replayed(session_key)
+            handle = self._turn_recovery_handle(
+                session_key,
+                source=event.source,
+                event=event,
+            )
+            if handle:
+                handle.mark_replayed()
             await self._handle_message_with_agent(event, event.source, session_key)
             return True
         except Exception as exc:
@@ -797,52 +763,26 @@ class GatewayRunner:
         with self._pending_approvals_lock_obj():
             return [(key, dict(value)) for key, value in self._pending_approvals.items()]
 
-    def _build_recovery_fallback_payload(
+    def _turn_recovery_handle(
         self,
         session_key: str,
         *,
-        recovery_kind: str,
-        summary: str,
-        command_preview: str = "",
         source: Optional[SessionSource] = None,
         session_id: Optional[str] = None,
         event: Optional[MessageEvent] = None,
-    ) -> Optional[Dict[str, Any]]:
+        fallback_text: str = "interrupted turn",
+    ) -> Optional[TurnRecoveryHandle]:
         session_store = getattr(self, "session_store", None)
         if session_store is None:
             return None
-
-        context = session_store.get_session_recovery_context(session_key)
-        if context is None and (source is None or session_id is None):
-            return None
-
-        source = source or context.get("origin")
-        session_id = session_id or context.get("session_id")
-        if source is None or session_id is None:
-            return None
-
-        if event is None:
-            event = MessageEvent(
-                text=command_preview or summary or "interrupted turn",
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=None,
-                timestamp=datetime.now(),
-            )
-
-        payload = self._build_turn_recovery_payload(
-            session_id=session_id,
+        return TurnRecoveryHandle.from_store(
+            session_store,
+            session_key,
             source=source,
+            session_id=session_id,
             event=event,
+            fallback_text=fallback_text,
         )
-        payload.update(
-            resume_safe=False,
-            unsafe_reason=recovery_kind,
-            recovery_kind=recovery_kind,
-            summary=summary,
-            command_preview=command_preview,
-        )
-        return payload
 
     def _mark_turn_recovery_unsafe(
         self,
@@ -855,23 +795,15 @@ class GatewayRunner:
         session_id: Optional[str] = None,
         event: Optional[MessageEvent] = None,
     ) -> None:
-        session_store = getattr(self, "session_store", None)
-        if session_store is None:
-            return
-        fallback_recovery = self._build_recovery_fallback_payload(
+        handle = self._turn_recovery_handle(
             session_key,
-            recovery_kind=recovery_kind,
-            summary=summary,
-            command_preview=command_preview,
             source=source,
             session_id=session_id,
             event=event,
         )
-        session_store.update_pending_recovery(
-            session_key,
-            recovery=fallback_recovery,
-            resume_safe=False,
-            unsafe_reason=recovery_kind,
+        if handle is None:
+            return
+        handle.mark_unsafe(
             recovery_kind=recovery_kind,
             summary=summary,
             command_preview=command_preview,
@@ -931,6 +863,37 @@ class GatewayRunner:
             summary=summary,
             command_preview=approval.get("command_preview", ""),
         )
+
+    @staticmethod
+    def _classify_pre_interrupt_activity(activity: Dict[str, Any]) -> Optional[tuple[str, str]]:
+        current_tool = (activity.get("current_tool") or "").strip()
+        if current_tool:
+            return (
+                "tool_execution_interrupted",
+                f"The turn was interrupted while tool `{current_tool}` was running.",
+            )
+
+        last_desc = str(activity.get("last_activity_desc") or "").strip()
+        lowered = last_desc.lower()
+        if lowered.startswith("executing tool:"):
+            tool_name = last_desc.split(":", 1)[1].strip()
+            if tool_name:
+                return (
+                    "tool_execution_interrupted",
+                    f"The turn was interrupted while tool `{tool_name}` was running.",
+                )
+            return (
+                "tool_execution_interrupted",
+                "The turn was interrupted while a tool was running.",
+            )
+
+        if lowered.startswith("tool completed:"):
+            return (
+                "side_effect_boundary_unknown",
+                f"The turn was interrupted immediately after tool completion: {last_desc}",
+            )
+
+        return None
 
     # -- Ambient GBrain signal detector ---------------------------------
 
@@ -2100,26 +2063,25 @@ class GatewayRunner:
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
+            activity = {}
+            try:
+                if hasattr(agent, "get_activity_summary"):
+                    activity = agent.get_activity_summary() or {}
+            except Exception as e:
+                logger.debug("Failed reading activity summary during shutdown: %s", e)
             try:
                 agent.interrupt("Gateway shutting down")
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key[:20])
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
             try:
-                activity = agent.get_activity_summary() if hasattr(agent, "get_activity_summary") else {}
-                current_tool = activity.get("current_tool")
-                last_desc = activity.get("last_activity_desc", "")
-                if current_tool:
+                classification = self._classify_pre_interrupt_activity(activity)
+                if classification:
+                    recovery_kind, summary = classification
                     self._mark_turn_recovery_unsafe(
                         session_key,
-                        recovery_kind="tool_execution_interrupted",
-                        summary=f"The turn was interrupted while tool `{current_tool}` was running.",
-                    )
-                elif last_desc and "tool" in last_desc.lower():
-                    self._mark_turn_recovery_unsafe(
-                        session_key,
-                        recovery_kind="side_effect_boundary_unknown",
-                        summary=f"The turn was interrupted near tool execution: {last_desc}",
+                        recovery_kind=recovery_kind,
+                        summary=summary,
                     )
             except Exception as e:
                 logger.debug("Failed to classify risky recovery during shutdown: %s", e)
@@ -3005,14 +2967,14 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
-        self.session_store.set_pending_recovery(
-            session_key,
-            self._build_turn_recovery_payload(
-                session_id=session_entry.session_id,
-                source=source,
-                event=event,
-            ),
+        recovery_handle = TurnRecoveryHandle(
+            session_store=self.session_store,
+            session_key=session_key,
+            session_id=session_entry.session_id,
+            source=source,
+            event=event,
         )
+        recovery_handle.begin()
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -3617,6 +3579,7 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 event_message_id=event.message_id,
+                recovery_handle=recovery_handle,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -3670,6 +3633,7 @@ class GatewayRunner:
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
+                recovery_handle.rebind(session_id=session_entry.session_id)
 
             # Prepend reasoning/thinking if display is enabled
             if getattr(self, "_show_reasoning", False) and response:
@@ -3789,7 +3753,7 @@ class GatewayRunner:
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
-            self.session_store.clear_pending_recovery(session_entry.session_key)
+            recovery_handle.clear()
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -3814,7 +3778,7 @@ class GatewayRunner:
             return response
             
         except Exception as e:
-            self.session_store.clear_pending_recovery(session_entry.session_key)
+            recovery_handle.clear()
             # Stop typing indicator on error too
             try:
                 _err_adapter = self.adapters.get(source.platform)
@@ -7088,6 +7052,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        recovery_handle: Optional[TurnRecoveryHandle] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -8153,6 +8118,19 @@ class GatewayRunner:
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
+                pending_event = MessageEvent(
+                    text=pending,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=event_message_id,
+                )
+                if recovery_handle is not None:
+                    recovery_handle.stage_followup(
+                        session_id=session_entry.session_id,
+                        source=source,
+                        event=pending_event,
+                    )
+
                 if not was_interrupted:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
@@ -8171,28 +8149,16 @@ class GatewayRunner:
                 # new message).
 
                 # Process the pending message with updated history
-                self.session_store.set_pending_recovery(
-                    session_key,
-                    self._build_turn_recovery_payload(
-                        session_id=session_entry.session_id,
-                        source=source,
-                        event=MessageEvent(
-                            text=pending,
-                            message_type=MessageType.TEXT,
-                            source=source,
-                            message_id=event_message_id,
-                        ),
-                    ),
-                )
                 updated_history = result.get("messages", history)
                 return await self._run_agent(
                     message=pending,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=source,
-                    session_id=session_id,
+                    session_id=session_entry.session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
+                    recovery_handle=recovery_handle,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task

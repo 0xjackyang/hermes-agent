@@ -1024,6 +1024,14 @@ class SessionStore:
             entry.pending_recovery = None
             self._save()
 
+    def get_pending_recovery(self, session_key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry or not entry.pending_recovery:
+                return None
+            return dict(entry.pending_recovery)
+
     def get_session_recovery_context(self, session_key: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             self._ensure_loaded_locked()
