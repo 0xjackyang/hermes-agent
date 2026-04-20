@@ -526,6 +526,7 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        self._pending_approvals_lock = _threading.Lock()
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -677,7 +678,7 @@ class GatewayRunner:
             timestamp=timestamp,
         )
 
-    async def _recover_pending_turns(self) -> None:
+    async def _recover_pending_turns(self, platforms: Optional[set[Platform]] = None) -> None:
         try:
             recoveries = self.session_store.list_pending_recoveries()
         except Exception as exc:
@@ -693,6 +694,9 @@ class GatewayRunner:
                 self.session_store.clear_pending_recovery(session_key)
                 continue
 
+            if platforms and event.source.platform not in platforms:
+                continue
+
             adapter = self.adapters.get(event.source.platform)
             if adapter is None:
                 logger.info(
@@ -705,17 +709,13 @@ class GatewayRunner:
             resume_safe = recovery.get("resume_safe", True)
             attempts = int(recovery.get("resume_attempts", 0))
             if resume_safe and attempts < 1:
-                self.session_store.mark_pending_recovery_replayed(session_key)
                 logger.info(
                     "Replaying interrupted turn for %s (session=%s attempt=%s)",
                     session_key[:40],
                     recovery.get("session_id", ""),
                     attempts + 1,
                 )
-                try:
-                    await adapter.handle_message(event)
-                except Exception as exc:
-                    logger.warning("Failed to replay interrupted turn for %s: %s", session_key[:40], exc)
+                await self._replay_pending_turn(session_key, event)
                 continue
 
             reason = recovery.get("unsafe_reason") or "recovery_retry_exhausted"
@@ -736,7 +736,7 @@ class GatewayRunner:
                     body = (
                         "⚠️ Your previous turn was interrupted while waiting for approval.\n"
                         + "\n\n".join(details)
-                        + "\n\nNo command was run. If you still want it, please resend the request and approve it again."
+                        + "\n\nThe command was not auto-resumed. If you granted approval close to the restart, verify current state before resending and approving it again."
                     )
                 elif recovery_kind == "tool_execution_interrupted":
                     body = (
@@ -764,6 +764,86 @@ class GatewayRunner:
                 logger.debug("Failed to send recovery notice for %s: %s", session_key[:40], exc)
             self.session_store.clear_pending_recovery(session_key)
 
+    async def _replay_pending_turn(self, session_key: str, event: MessageEvent) -> bool:
+        if session_key in self._running_agents:
+            logger.info(
+                "Deferring replay for %s because the session is already active",
+                session_key[:40],
+            )
+            return False
+
+        self._running_agents[session_key] = _AGENT_PENDING_SENTINEL
+        self._running_agents_ts[session_key] = time.time()
+        try:
+            self.session_store.mark_pending_recovery_replayed(session_key)
+            await self._handle_message_with_agent(event, event.source, session_key)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to replay interrupted turn for %s: %s", session_key[:40], exc)
+            return True
+        finally:
+            if self._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
+                del self._running_agents[session_key]
+            self._running_agents_ts.pop(session_key, None)
+
+    def _pending_approvals_lock_obj(self) -> threading.Lock:
+        lock = getattr(self, "_pending_approvals_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._pending_approvals_lock = lock
+        return lock
+
+    def _snapshot_pending_approvals(self) -> List[tuple[str, Dict[str, Any]]]:
+        with self._pending_approvals_lock_obj():
+            return [(key, dict(value)) for key, value in self._pending_approvals.items()]
+
+    def _build_recovery_fallback_payload(
+        self,
+        session_key: str,
+        *,
+        recovery_kind: str,
+        summary: str,
+        command_preview: str = "",
+        source: Optional[SessionSource] = None,
+        session_id: Optional[str] = None,
+        event: Optional[MessageEvent] = None,
+    ) -> Optional[Dict[str, Any]]:
+        session_store = getattr(self, "session_store", None)
+        if session_store is None:
+            return None
+
+        context = session_store.get_session_recovery_context(session_key)
+        if context is None and (source is None or session_id is None):
+            return None
+
+        source = source or context.get("origin")
+        session_id = session_id or context.get("session_id")
+        if source is None or session_id is None:
+            return None
+
+        if event is None:
+            event = MessageEvent(
+                text=command_preview or summary or "interrupted turn",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=None,
+                timestamp=datetime.now(),
+            )
+
+        payload = self._build_turn_recovery_payload(
+            session_id=session_id,
+            source=source,
+            event=event,
+        )
+        payload.update(
+            resume_safe=False,
+            unsafe_reason=recovery_kind,
+            recovery_kind=recovery_kind,
+            summary=summary,
+            command_preview=command_preview,
+        )
+        return payload
+
     def _mark_turn_recovery_unsafe(
         self,
         session_key: str,
@@ -771,12 +851,25 @@ class GatewayRunner:
         recovery_kind: str,
         summary: str,
         command_preview: str = "",
+        source: Optional[SessionSource] = None,
+        session_id: Optional[str] = None,
+        event: Optional[MessageEvent] = None,
     ) -> None:
         session_store = getattr(self, "session_store", None)
         if session_store is None:
             return
+        fallback_recovery = self._build_recovery_fallback_payload(
+            session_key,
+            recovery_kind=recovery_kind,
+            summary=summary,
+            command_preview=command_preview,
+            source=source,
+            session_id=session_id,
+            event=event,
+        )
         session_store.update_pending_recovery(
             session_key,
+            recovery=fallback_recovery,
             resume_safe=False,
             unsafe_reason=recovery_kind,
             recovery_kind=recovery_kind,
@@ -784,27 +877,60 @@ class GatewayRunner:
             command_preview=command_preview,
         )
 
-    def _remember_pending_approval(self, session_key: str, approval_data: dict) -> None:
+    def _remember_pending_approval(
+        self,
+        session_key: str,
+        approval_data: dict,
+        *,
+        source: Optional[SessionSource] = None,
+        session_id: Optional[str] = None,
+        event: Optional[MessageEvent] = None,
+    ) -> None:
         command = approval_data.get("command", "")
         description = approval_data.get("description", "dangerous command")
         pattern_keys = list(approval_data.get("pattern_keys", []))
         command_preview = command[:200] + "..." if len(command) > 200 else command
-        self._pending_approvals[session_key] = {
-            "command": command,
-            "description": description,
-            "pattern_keys": pattern_keys,
-            "command_preview": command_preview,
-            "created_at": datetime.now().isoformat(),
-        }
+        with self._pending_approvals_lock_obj():
+            self._pending_approvals[session_key] = {
+                "command": command,
+                "description": description,
+                "pattern_keys": pattern_keys,
+                "command_preview": command_preview,
+                "created_at": datetime.now().isoformat(),
+            }
         self._mark_turn_recovery_unsafe(
             session_key,
             recovery_kind="approval_pending",
             summary=f"Dangerous command approval was pending: {description}",
             command_preview=command_preview,
+            source=source,
+            session_id=session_id,
+            event=event,
         )
 
-    def _clear_pending_approval(self, session_key: str) -> None:
-        self._pending_approvals.pop(session_key, None)
+    def _clear_pending_approval(self, session_key: str, *, resolution: Optional[str] = None) -> None:
+        with self._pending_approvals_lock_obj():
+            approval = self._pending_approvals.pop(session_key, None)
+        if resolution is None or approval is None:
+            return
+
+        if resolution == "approved":
+            summary = (
+                "A dangerous command was approved before the interruption. "
+                "Execution may have started before the gateway stopped."
+            )
+        else:
+            summary = (
+                "A dangerous-command approval changed state before the interruption. "
+                "The turn was not auto-resumed."
+            )
+
+        self._mark_turn_recovery_unsafe(
+            session_key,
+            recovery_kind="side_effect_boundary_unknown",
+            summary=summary,
+            command_preview=approval.get("command_preview", ""),
+        )
 
     # -- Ambient GBrain signal detector ---------------------------------
 
@@ -1923,6 +2049,14 @@ class GatewayRunner:
                             build_channel_directory(self.adapters)
                         except Exception:
                             pass
+                        try:
+                            await self._recover_pending_turns(platforms={platform})
+                        except Exception as exc:
+                            logger.warning(
+                                "Pending recovery retry after %s reconnect failed: %s",
+                                platform.value,
+                                exc,
+                            )
                     else:
                         # Check if the failure is non-retryable
                         if adapter.has_fatal_error and not adapter.fatal_error_retryable:
@@ -2020,6 +2154,14 @@ class GatewayRunner:
             _task.cancel()
         self._background_tasks.clear()
 
+        for session_key, approval in self._snapshot_pending_approvals():
+            self._mark_turn_recovery_unsafe(
+                session_key,
+                recovery_kind="approval_pending",
+                summary=f"Dangerous command approval was pending: {approval.get('description', 'dangerous command')}",
+                command_preview=approval.get("command_preview", ""),
+            )
+
         drain_result = await self._drain_agent_executor_tasks(timeout=15.0)
         if drain_result["timed_out"]:
             logger.warning(
@@ -2036,7 +2178,7 @@ class GatewayRunner:
                 drain_result["pending"],
             )
 
-        for session_key, approval in list(self._pending_approvals.items()):
+        for session_key, approval in self._snapshot_pending_approvals():
             self._mark_turn_recovery_unsafe(
                 session_key,
                 recovery_kind="approval_pending",
@@ -2047,7 +2189,8 @@ class GatewayRunner:
         self.adapters.clear()
         self._running_agents.clear()
         self._pending_messages.clear()
-        self._pending_approvals.clear()
+        with self._pending_approvals_lock_obj():
+            self._pending_approvals.clear()
         self._shutdown_event.set()
         
         from gateway.status import remove_pid_file, write_runtime_status
@@ -6082,7 +6225,9 @@ class GatewayRunner:
         )
 
         if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
+            with self._pending_approvals_lock_obj():
+                has_stale_pending = session_key in self._pending_approvals
+            if has_stale_pending:
                 self._clear_pending_approval(session_key)
                 return "⚠️ Approval expired (agent is no longer waiting). Ask the agent to try again."
             return "No pending command to approve."
@@ -6105,7 +6250,7 @@ class GatewayRunner:
         count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
         if not count:
             return "No pending command to approve."
-        self._clear_pending_approval(session_key)
+        self._clear_pending_approval(session_key, resolution="approved")
 
         # Resume typing indicator — agent is about to continue processing.
         _adapter = self.adapters.get(source.platform)
@@ -6132,7 +6277,9 @@ class GatewayRunner:
         )
 
         if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
+            with self._pending_approvals_lock_obj():
+                has_stale_pending = session_key in self._pending_approvals
+            if has_stale_pending:
                 self._clear_pending_approval(session_key)
                 return "❌ Command denied (approval was stale)."
             return "No pending command to deny."
@@ -6143,7 +6290,7 @@ class GatewayRunner:
         count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
         if not count:
             return "No pending command to deny."
-        self._clear_pending_approval(session_key)
+        self._clear_pending_approval(session_key, resolution="denied")
 
         # Resume typing indicator — agent continues (with BLOCKED result).
         _adapter = self.adapters.get(source.platform)
@@ -7512,7 +7659,19 @@ class GatewayRunner:
                 # status; pausing prevents _keep_typing from re-setting it.
                 # Typing resumes in _handle_approve_command/_handle_deny_command.
                 _status_adapter.pause_typing_for_chat(_status_chat_id)
-                self._remember_pending_approval(_approval_session_key, approval_data)
+                self._remember_pending_approval(
+                    _approval_session_key,
+                    approval_data,
+                    source=source,
+                    session_id=session_id,
+                    event=MessageEvent(
+                        text=message,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id=event_message_id,
+                        timestamp=datetime.now(),
+                    ),
+                )
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")

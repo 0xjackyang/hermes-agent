@@ -8,7 +8,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, SessionStore
 
 
@@ -55,6 +55,17 @@ def _event(text="hello"):
     )
 
 
+def _recovery_runner(store: SessionStore) -> GatewayRunner:
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner.adapters = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_approvals = {}
+    runner._pending_approvals_lock = threading.Lock()
+    return runner
+
+
 def test_session_store_persists_pending_recovery(tmp_path: Path):
     sessions_dir = tmp_path / "sessions"
     store = SessionStore(sessions_dir, _config())
@@ -93,11 +104,18 @@ async def test_gateway_replays_safe_pending_turn(tmp_path: Path):
     event = _event("resume me")
     entry = store.get_or_create_session(source)
 
-    runner = object.__new__(GatewayRunner)
-    runner.session_store = store
+    runner = _recovery_runner(store)
     adapter = RecoveryAdapter()
     adapter.handle_message = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: adapter}
+    replay_calls = []
+
+    async def fake_handle_message_with_agent(replay_event, replay_source, quick_key):
+        replay_calls.append((replay_event, replay_source, quick_key))
+        assert runner._running_agents[quick_key] is _AGENT_PENDING_SENTINEL
+        return None
+
+    runner._handle_message_with_agent = fake_handle_message_with_agent
 
     store.set_pending_recovery(
         entry.session_key,
@@ -110,7 +128,10 @@ async def test_gateway_replays_safe_pending_turn(tmp_path: Path):
 
     await runner._recover_pending_turns()
 
-    adapter.handle_message.assert_awaited_once()
+    adapter.handle_message.assert_not_called()
+    assert len(replay_calls) == 1
+    assert replay_calls[0][2] == entry.session_key
+    assert runner._running_agents == {}
     recovery = store.list_pending_recoveries()[0]["recovery"]
     assert recovery["resume_attempts"] == 1
 
@@ -147,7 +168,8 @@ async def test_gateway_skips_unsafe_pending_turn_and_notifies(tmp_path: Path):
     assert adapter.sent
     assert "waiting for approval" in adapter.sent[0][1]
     assert "rm -rf /tmp/test" in adapter.sent[0][1]
-    assert "No command was run" in adapter.sent[0][1]
+    assert "not auto-resumed" in adapter.sent[0][1]
+    assert "verify current state" in adapter.sent[0][1]
     assert store.list_pending_recoveries() == []
 
 
@@ -184,6 +206,106 @@ async def test_gateway_skips_tool_interrupted_turn_and_notifies(tmp_path: Path):
     assert store.list_pending_recoveries() == []
 
 
+def test_gateway_remember_pending_approval_upserts_missing_recovery(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    event = _event("please delete it")
+    entry = store.get_or_create_session(source)
+
+    runner = _recovery_runner(store)
+    runner._remember_pending_approval(
+        entry.session_key,
+        {
+            "command": "rm -rf /tmp/test",
+            "description": "recursive delete",
+            "pattern_keys": ["rm_rf"],
+        },
+        source=source,
+        session_id=entry.session_id,
+        event=event,
+    )
+
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["unsafe_reason"] == "approval_pending"
+    assert recovery["command_preview"] == "rm -rf /tmp/test"
+    assert recovery["event"]["text"] == "please delete it"
+
+
+@pytest.mark.asyncio
+async def test_gateway_second_restart_exhausts_safe_replay(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    event = _event("resume me twice")
+    entry = store.get_or_create_session(source)
+
+    runner = _recovery_runner(store)
+    adapter = RecoveryAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._handle_message_with_agent = AsyncMock(return_value=None)
+
+    store.set_pending_recovery(
+        entry.session_key,
+        GatewayRunner._build_turn_recovery_payload(
+            session_id=entry.session_id,
+            source=source,
+            event=event,
+        ),
+    )
+
+    await runner._recover_pending_turns()
+    await runner._recover_pending_turns()
+
+    runner._handle_message_with_agent.assert_awaited_once()
+    assert adapter.sent
+    assert "recovery_retry_exhausted" in adapter.sent[0][1]
+    assert store.list_pending_recoveries() == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_approve_clears_approval_specific_recovery_state(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    event = _event("/approve")
+    entry = store.get_or_create_session(source)
+
+    runner = _recovery_runner(store)
+    adapter = RecoveryAdapter()
+    adapter.resume_typing_for_chat = MagicMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    payload = GatewayRunner._build_turn_recovery_payload(
+        session_id=entry.session_id,
+        source=source,
+        event=_event("dangerous command"),
+    )
+    payload["resume_safe"] = False
+    payload["unsafe_reason"] = "approval_pending"
+    payload["recovery_kind"] = "approval_pending"
+    payload["summary"] = "Dangerous command approval was pending: recursive delete"
+    payload["command_preview"] = "rm -rf /tmp/test"
+    store.set_pending_recovery(entry.session_key, payload)
+
+    runner._pending_approvals[entry.session_key] = {
+        "description": "recursive delete",
+        "command_preview": "rm -rf /tmp/test",
+    }
+
+    with patch("tools.approval.has_blocking_approval", return_value=True), patch(
+        "tools.approval.resolve_gateway_approval",
+        return_value=1,
+    ):
+        result = await runner._handle_approve_command(event)
+
+    assert "approved" in result
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["unsafe_reason"] == "side_effect_boundary_unknown"
+    assert recovery["recovery_kind"] == "side_effect_boundary_unknown"
+    assert recovery["summary"].startswith("A dangerous command was approved")
+
+
 @pytest.mark.asyncio
 async def test_gateway_stop_marks_pending_approval_unsafe(tmp_path: Path):
     sessions_dir = tmp_path / "sessions"
@@ -206,15 +328,8 @@ async def test_gateway_stop_marks_pending_approval_unsafe(tmp_path: Path):
     runner._shutdown_all_gateway_honcho = lambda: None
     runner.adapters = {}
     runner._running_agents = {}
-
-    store.set_pending_recovery(
-        entry.session_key,
-        GatewayRunner._build_turn_recovery_payload(
-            session_id=entry.session_id,
-            source=source,
-            event=event,
-        ),
-    )
+    runner._running_agents_ts = {}
+    runner._pending_approvals_lock = threading.Lock()
     runner._pending_approvals[entry.session_key] = {
         "description": "recursive delete",
         "command_preview": "rm -rf /tmp/test",
@@ -271,3 +386,45 @@ async def test_gateway_stop_marks_tool_execution_unsafe(tmp_path: Path):
     recovery = store.list_pending_recoveries()[0]["recovery"]
     assert recovery["unsafe_reason"] == "tool_execution_interrupted"
     assert "terminal" in recovery["summary"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_watcher_retries_pending_recovery_for_reconnected_platform(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    entry = store.get_or_create_session(source)
+
+    runner = _recovery_runner(store)
+    runner._running = True
+    runner.config = _config()
+    runner.delivery_router = MagicMock()
+    runner.delivery_router.adapters = {}
+    runner._failed_platforms = {
+        Platform.TELEGRAM: {
+            "config": PlatformConfig(enabled=True, token="***"),
+            "attempts": 0,
+            "next_retry": 0,
+        }
+    }
+    runner._create_adapter = MagicMock(return_value=RecoveryAdapter())
+    runner._sync_voice_mode_state_to_adapter = lambda _adapter: None
+    runner._handle_message = AsyncMock()
+    runner._handle_adapter_fatal_error = MagicMock()
+
+    async def fake_recover_pending_turns(platforms=None):
+        runner._running = False
+
+    runner._recover_pending_turns = AsyncMock(side_effect=fake_recover_pending_turns)
+
+    async def fast_sleep(_seconds):
+        return None
+
+    with patch("asyncio.sleep", new=fast_sleep), patch(
+        "gateway.channel_directory.build_channel_directory"
+    ):
+        await GatewayRunner._platform_reconnect_watcher(runner)
+
+    runner._recover_pending_turns.assert_awaited_once_with(platforms={Platform.TELEGRAM})
+    assert Platform.TELEGRAM in runner.adapters
+    assert runner.delivery_router.adapters == runner.adapters

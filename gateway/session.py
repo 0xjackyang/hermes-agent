@@ -1024,14 +1024,43 @@ class SessionStore:
             entry.pending_recovery = None
             self._save()
 
-    def update_pending_recovery(self, session_key: str, **updates: Any) -> None:
+    def get_session_recovery_context(self, session_key: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
-            if not entry or not entry.pending_recovery:
-                return
+            if not entry:
+                return None
+            return {
+                "session_id": entry.session_id,
+                "origin": entry.origin,
+                "display_name": entry.display_name,
+                "platform": entry.platform,
+                "chat_type": entry.chat_type,
+            }
+
+    def update_pending_recovery(
+        self,
+        session_key: str,
+        *,
+        recovery: Optional[Dict[str, Any]] = None,
+        **updates: Any,
+    ) -> bool:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return False
+            if not entry.pending_recovery:
+                if recovery is None:
+                    logger.debug(
+                        "Session %s: pending recovery update skipped because no envelope exists",
+                        session_key[:40],
+                    )
+                    return False
+                entry.pending_recovery = dict(recovery)
             entry.pending_recovery.update(updates)
             self._save()
+            return True
 
     def mark_pending_recovery_unsafe(self, session_key: str, reason: str) -> None:
         with self._lock:

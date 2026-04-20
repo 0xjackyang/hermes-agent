@@ -1,5 +1,7 @@
 import asyncio
 import threading
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,7 +9,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, SessionStore, build_session_key
 
 
 class StubAdapter(BasePlatformAdapter):
@@ -139,3 +141,49 @@ async def test_gateway_stop_drains_agent_executor_tasks():
 
     assert task.done()
     assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_persists_approval_added_during_drain(tmp_path: Path):
+    sessions_dir = tmp_path / "sessions"
+    config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+    store = SessionStore(sessions_dir, config)
+    source = _source()
+    entry = store.get_or_create_session(source)
+    event = MessageEvent(text="dangerous", source=source, message_id="1", timestamp=datetime.now())
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = config
+    runner.session_store = store
+    runner._running = True
+    runner._shutdown_event = asyncio.Event()
+    runner._exit_reason = None
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._pending_approvals_lock = threading.Lock()
+    runner._background_tasks = set()
+    runner._agent_executor_tasks = set()
+    runner._cron_stop_event = threading.Event()
+    runner._shutdown_all_gateway_honcho = lambda: None
+    runner.adapters = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+
+    async def fake_drain_agent_executor_tasks(timeout: float):
+        runner._remember_pending_approval(
+            entry.session_key,
+            {"command": "rm -rf /tmp/x", "description": "recursive delete"},
+            source=source,
+            session_id=entry.session_id,
+            event=event,
+        )
+        return {"timed_out": False, "tracked": 1, "completed": 1, "pending": 0}
+
+    runner._drain_agent_executor_tasks = fake_drain_agent_executor_tasks
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["unsafe_reason"] == "approval_pending"
+    assert recovery["command_preview"] == "rm -rf /tmp/x"
