@@ -368,6 +368,10 @@ class SessionEntry:
     # survives gateway restarts (the old in-memory _pre_flushed_sessions
     # set was lost on restart, causing redundant re-flushes).
     memory_flushed: bool = False
+
+    # One-shot recovery envelope for an in-flight foreground turn that was
+    # interrupted by process shutdown/restart before completion.
+    pending_recovery: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -387,6 +391,7 @@ class SessionEntry:
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
             "memory_flushed": self.memory_flushed,
+            "pending_recovery": self.pending_recovery,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -423,6 +428,7 @@ class SessionEntry:
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
             memory_flushed=data.get("memory_flushed", False),
+            pending_recovery=data.get("pending_recovery"),
         )
 
 
@@ -995,6 +1001,66 @@ class SessionStore:
             return jsonl_messages
 
         return db_messages
+
+    def set_pending_recovery(
+        self,
+        session_key: str,
+        recovery: Dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry:
+                return
+            entry.pending_recovery = recovery
+            self._save()
+
+    def clear_pending_recovery(self, session_key: str) -> None:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry or entry.pending_recovery is None:
+                return
+            entry.pending_recovery = None
+            self._save()
+
+    def mark_pending_recovery_unsafe(self, session_key: str, reason: str) -> None:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry or not entry.pending_recovery:
+                return
+            entry.pending_recovery["resume_safe"] = False
+            entry.pending_recovery["unsafe_reason"] = reason
+            self._save()
+
+    def mark_pending_recovery_replayed(self, session_key: str) -> None:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if not entry or not entry.pending_recovery:
+                return
+            entry.pending_recovery["resume_attempts"] = int(
+                entry.pending_recovery.get("resume_attempts", 0)
+            ) + 1
+            entry.pending_recovery["last_replayed_at"] = _now().isoformat()
+            self._save()
+
+    def list_pending_recoveries(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            self._ensure_loaded_locked()
+            result = []
+            for entry in self._entries.values():
+                if entry.pending_recovery:
+                    result.append(
+                        {
+                            "session_key": entry.session_key,
+                            "session_id": entry.session_id,
+                            "origin": entry.origin.to_dict() if entry.origin else None,
+                            "recovery": dict(entry.pending_recovery),
+                        }
+                    )
+            return result
 
 
 def build_session_context(

@@ -615,6 +615,126 @@ class GatewayRunner:
         except Exception:
             return False
 
+    @staticmethod
+    def _build_turn_recovery_payload(
+        *,
+        session_id: str,
+        source: SessionSource,
+        event: MessageEvent,
+    ) -> Dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "source": source.to_dict(),
+            "event": {
+                "text": event.text,
+                "message_type": event.message_type.value if hasattr(event.message_type, "value") else str(event.message_type),
+                "message_id": event.message_id,
+                "media_urls": list(event.media_urls),
+                "media_types": list(event.media_types),
+                "reply_to_message_id": event.reply_to_message_id,
+                "reply_to_text": event.reply_to_text,
+                "auto_skill": event.auto_skill,
+                "internal": event.internal,
+                "timestamp": event.timestamp.isoformat() if getattr(event, "timestamp", None) else None,
+            },
+            "resume_safe": True,
+            "unsafe_reason": None,
+            "resume_attempts": 0,
+            "created_at": datetime.now().isoformat(),
+        }
+
+    @staticmethod
+    def _restore_recovery_event(payload: Dict[str, Any]) -> Optional[MessageEvent]:
+        try:
+            source = SessionSource.from_dict(payload["source"])
+            event_data = payload["event"]
+        except Exception:
+            return None
+
+        message_type_raw = event_data.get("message_type", MessageType.TEXT.value)
+        try:
+            message_type = MessageType(message_type_raw)
+        except Exception:
+            message_type = MessageType.TEXT
+
+        timestamp_raw = event_data.get("timestamp")
+        try:
+            timestamp = datetime.fromisoformat(timestamp_raw) if timestamp_raw else datetime.now()
+        except Exception:
+            timestamp = datetime.now()
+
+        return MessageEvent(
+            text=event_data.get("text", ""),
+            message_type=message_type,
+            source=source,
+            message_id=event_data.get("message_id"),
+            media_urls=list(event_data.get("media_urls", [])),
+            media_types=list(event_data.get("media_types", [])),
+            reply_to_message_id=event_data.get("reply_to_message_id"),
+            reply_to_text=event_data.get("reply_to_text"),
+            auto_skill=event_data.get("auto_skill"),
+            internal=bool(event_data.get("internal", False)),
+            timestamp=timestamp,
+        )
+
+    async def _recover_pending_turns(self) -> None:
+        try:
+            recoveries = self.session_store.list_pending_recoveries()
+        except Exception as exc:
+            logger.warning("Pending turn recovery load failed: %s", exc)
+            return
+
+        for item in recoveries:
+            session_key = item.get("session_key", "")
+            recovery = item.get("recovery") or {}
+            event = self._restore_recovery_event(recovery)
+            if event is None:
+                logger.warning("Skipping malformed recovery payload for %s", session_key[:40])
+                self.session_store.clear_pending_recovery(session_key)
+                continue
+
+            adapter = self.adapters.get(event.source.platform)
+            if adapter is None:
+                logger.info(
+                    "Deferring recovery for %s — adapter %s is not connected",
+                    session_key[:40],
+                    event.source.platform.value if event.source.platform else "unknown",
+                )
+                continue
+
+            resume_safe = recovery.get("resume_safe", True)
+            attempts = int(recovery.get("resume_attempts", 0))
+            if resume_safe and attempts < 1:
+                self.session_store.mark_pending_recovery_replayed(session_key)
+                logger.info(
+                    "Replaying interrupted turn for %s (session=%s attempt=%s)",
+                    session_key[:40],
+                    recovery.get("session_id", ""),
+                    attempts + 1,
+                )
+                try:
+                    await adapter.handle_message(event)
+                except Exception as exc:
+                    logger.warning("Failed to replay interrupted turn for %s: %s", session_key[:40], exc)
+                continue
+
+            reason = recovery.get("unsafe_reason") or "recovery_retry_exhausted"
+            logger.warning(
+                "Interrupted turn for %s was not auto-resumed (%s)",
+                session_key[:40],
+                reason,
+            )
+            try:
+                metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await adapter.send(
+                    event.source.chat_id,
+                    f"⚠️ Your previous turn was interrupted by a gateway restart and was not auto-resumed ({reason}). Please resend it.",
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                logger.debug("Failed to send recovery notice for %s: %s", session_key[:40], exc)
+            self.session_store.clear_pending_recovery(session_key)
+
     # -- Ambient GBrain signal detector ---------------------------------
 
     @staticmethod
@@ -1517,7 +1637,9 @@ class GatewayRunner:
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
-        
+
+        await self._recover_pending_turns()
+
         # Check if we're restarting after a /update command. If the update is
         # still running, keep watching so we notify once it actually finishes.
         notified = await self._send_update_notification()
@@ -1824,6 +1946,9 @@ class GatewayRunner:
                 drain_result["completed"],
                 drain_result["pending"],
             )
+
+        for session_key in list(self._pending_approvals.keys()):
+            self.session_store.mark_pending_recovery_unsafe(session_key, "approval_pending")
 
         self.adapters.clear()
         self._running_agents.clear()
@@ -2643,6 +2768,14 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        self.session_store.set_pending_recovery(
+            session_key,
+            self._build_turn_recovery_payload(
+                session_id=session_entry.session_id,
+                source=source,
+                event=event,
+            ),
+        )
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -3419,6 +3552,7 @@ class GatewayRunner:
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+            self.session_store.clear_pending_recovery(session_entry.session_key)
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -3443,6 +3577,7 @@ class GatewayRunner:
             return response
             
         except Exception as e:
+            self.session_store.clear_pending_recovery(session_entry.session_key)
             # Stop typing indicator on error too
             try:
                 _err_adapter = self.adapters.get(source.platform)
@@ -7780,6 +7915,19 @@ class GatewayRunner:
                 # new message).
 
                 # Process the pending message with updated history
+                self.session_store.set_pending_recovery(
+                    session_key,
+                    self._build_turn_recovery_payload(
+                        session_id=session_entry.session_id,
+                        source=source,
+                        event=MessageEvent(
+                            text=pending,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            message_id=event_message_id,
+                        ),
+                    ),
+                )
                 updated_history = result.get("messages", history)
                 return await self._run_agent(
                     message=pending,
