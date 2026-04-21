@@ -8126,7 +8126,7 @@ class GatewayRunner:
                 )
                 if recovery_handle is not None:
                     recovery_handle.stage_followup(
-                        session_id=session_entry.session_id,
+                        session_id=session_id,
                         source=source,
                         event=pending_event,
                     )
@@ -8155,7 +8155,7 @@ class GatewayRunner:
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=source,
-                    session_id=session_entry.session_id,
+                    session_id=session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
                     recovery_handle=recovery_handle,

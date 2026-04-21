@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -123,6 +124,25 @@ def test_turn_recovery_handle_stages_followup_resets_replay_count_for_new_turn(t
     recovery = store.list_pending_recoveries()[0]["recovery"]
     assert recovery["event"]["text"] == "follow up"
     assert recovery["resume_attempts"] == 0
+
+
+def test_run_agent_pending_recovery_branch_uses_scoped_session_id():
+    source = inspect.getsource(GatewayRunner._run_agent)
+
+    assert "session_entry.session_id" not in source
+    assert (
+        "recovery_handle.stage_followup(\n"
+        "                        session_id=session_id,"
+    ) in source
+    assert (
+        "return await self._run_agent(\n"
+        "                    message=pending,"
+    ) in source
+    assert (
+        "history=updated_history,\n"
+        "                    source=source,\n"
+        "                    session_id=session_id,"
+    ) in source
 
 
 def test_turn_recovery_handle_preserves_replay_count_for_same_turn(tmp_path: Path):
