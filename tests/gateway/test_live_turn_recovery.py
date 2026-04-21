@@ -1,5 +1,7 @@
 import asyncio
+import sys
 import threading
+import types
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -123,6 +125,116 @@ def test_turn_recovery_handle_stages_followup_resets_replay_count_for_new_turn(t
     recovery = store.list_pending_recoveries()[0]["recovery"]
     assert recovery["event"]["text"] == "follow up"
     assert recovery["resume_attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stages_pending_followup_with_effective_split_session_id(
+    tmp_path: Path,
+    monkeypatch,
+):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    first_event = _event("first")
+    followup_event = _event("follow up")
+    entry = store.get_or_create_session(source)
+    old_session_id = entry.session_id
+    split_session_id = "session-after-compression"
+
+    class SplitSessionAgent:
+        init_session_ids = []
+        calls = []
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id")
+            self.model = kwargs.get("model")
+            self.tools = []
+            type(self).init_session_ids.append(self.session_id)
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            type(self).calls.append((message, self.session_id, task_id))
+            if message == "first":
+                self.session_id = split_session_id
+                return {
+                    "final_response": "interrupted first response",
+                    "messages": [{"role": "user", "content": "first"}],
+                    "api_calls": 1,
+                    "interrupted": True,
+                }
+            return {
+                "final_response": "follow up done",
+                "messages": [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": "follow up done"},
+                ],
+                "api_calls": 1,
+            }
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = SplitSessionAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda user_config=None: "test-model")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "test-key", "provider": "test"},
+    )
+
+    runner = _recovery_runner(store)
+    runner.config = _config()
+    runner._prefill_messages = []
+    runner._ephemeral_system_prompt = ""
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
+    runner._smart_model_routing = {}
+    runner._agent_cache_lock = None
+    runner.hooks = MagicMock(loaded_hooks=False)
+    runner.hooks.emit = AsyncMock()
+
+    adapter = RecoveryAdapter()
+    adapter._pending_messages[entry.session_key] = followup_event
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    recovery_handle = TurnRecoveryHandle(
+        session_store=store,
+        session_key=entry.session_key,
+        session_id=old_session_id,
+        source=source,
+        event=first_event,
+    )
+    recovery_handle.begin()
+
+    result = await runner._run_agent(
+        message="first",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id=old_session_id,
+        session_key=entry.session_key,
+        event_message_id=first_event.message_id,
+        recovery_handle=recovery_handle,
+    )
+
+    assert result["final_response"] == "follow up done"
+    assert SplitSessionAgent.init_session_ids == [old_session_id, split_session_id]
+    assert SplitSessionAgent.calls == [
+        ("first", old_session_id, old_session_id),
+        ("follow up", split_session_id, split_session_id),
+    ]
+    recovery = store.get_pending_recovery(entry.session_key)
+    assert recovery["session_id"] == split_session_id
+    assert recovery["event"]["text"] == "follow up"
+    assert store._entries[entry.session_key].session_id == split_session_id
 
 
 @pytest.mark.parametrize("second_text", ["repeatable prompt", "different prompt"])

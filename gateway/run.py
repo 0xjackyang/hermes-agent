@@ -8120,6 +8120,9 @@ class GatewayRunner:
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
+                pending_session_id = session_id
+                if isinstance(response, dict):
+                    pending_session_id = response.get("session_id") or session_id
                 pending_event = MessageEvent(
                     text=pending,
                     message_type=MessageType.TEXT,
@@ -8128,7 +8131,7 @@ class GatewayRunner:
                 )
                 if recovery_handle is not None:
                     recovery_handle.stage_followup(
-                        session_id=session_entry.session_id,
+                        session_id=pending_session_id,
                         source=source,
                         event=pending_event,
                     )
@@ -8157,7 +8160,7 @@ class GatewayRunner:
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=source,
-                    session_id=session_entry.session_id,
+                    session_id=pending_session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
                     recovery_handle=recovery_handle,
