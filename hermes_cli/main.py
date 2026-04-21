@@ -4877,8 +4877,26 @@ For more help on a command:
     skills_update = skills_subparsers.add_parser("update", help="Update installed hub skills")
     skills_update.add_argument("name", nargs="?", help="Specific skill to update (default: all outdated skills)")
 
-    skills_audit = skills_subparsers.add_parser("audit", help="Re-scan installed hub skills")
-    skills_audit.add_argument("name", nargs="?", help="Specific skill to audit (default: all)")
+    skills_audit = skills_subparsers.add_parser(
+        "audit",
+        help="Audit installed skills for lifecycle metadata, freshness, duplicates, and bloat",
+    )
+    skills_audit.add_argument("name", nargs="?", help="Specific installed skill to audit (default: all)")
+    skills_audit.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    skills_audit.add_argument("--stale-days", type=int, default=90, help="Days since last use before a skill is marked stale")
+
+    skills_health = skills_subparsers.add_parser(
+        "health",
+        help="Summarize overall skill lifecycle health",
+    )
+    skills_health.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    skills_health.add_argument("--stale-days", type=int, default=90, help="Days since last use before a skill is marked stale")
+
+    skills_security_audit = skills_subparsers.add_parser(
+        "security-audit",
+        help="Re-scan installed hub skills for security",
+    )
+    skills_security_audit.add_argument("name", nargs="?", help="Specific hub-installed skill to audit (default: all)")
 
     skills_uninstall = skills_subparsers.add_parser("uninstall", help="Remove a hub-installed skill")
     skills_uninstall.add_argument("name", help="Skill name to remove")

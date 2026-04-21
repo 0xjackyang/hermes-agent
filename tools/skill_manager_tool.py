@@ -75,6 +75,14 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
 
 import yaml
 
+from agent.skill_utils import (
+    SKILL_CREATED_AT_UNKNOWN,
+    apply_skill_lifecycle_to_content,
+    parse_frontmatter,
+    skill_timestamp_now,
+    sync_skill_lifecycle_metadata,
+)
+
 
 # All skills live in ~/.hermes/skills/ (single source of truth)
 HERMES_HOME = get_hermes_home()
@@ -243,11 +251,11 @@ def _validate_file_path(file_path: str) -> Optional[str]:
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
     """
     Atomically write text content to a file.
-    
+
     Uses a temporary file in the same directory and os.replace() to ensure
     the target file is never left in a partially-written state if the process
     crashes or is interrupted.
-    
+
     Args:
         file_path: Target file path
         content: Content to write
@@ -272,11 +280,52 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         raise
 
 
+def _prepare_skill_content_with_metadata(
+    content: str,
+    *,
+    fallback_frontmatter: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+    created_at_default: Optional[str] = None,
+) -> str:
+    """Ensure lifecycle metadata is present before writing SKILL.md."""
+    created_at_value = created_at_default or SKILL_CREATED_AT_UNKNOWN
+    updated_content, _, _, _ = apply_skill_lifecycle_to_content(
+        content,
+        fallback_frontmatter=fallback_frontmatter,
+        created_at_default=created_at_value,
+        source_session_id=session_id,
+    )
+    return updated_content
+
+
+def _touch_skill_source_metadata(skill_dir: Path, session_id: Optional[str]) -> None:
+    """Update source_session_ids on SKILL.md after a non-SKILL.md mutation."""
+    if not session_id:
+        return
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
+        return
+    try:
+        sync_skill_lifecycle_metadata(
+            skill_md,
+            created_at_default=SKILL_CREATED_AT_UNKNOWN,
+            source_session_id=session_id,
+            persist=True,
+        )
+    except Exception:
+        logger.debug("Could not update skill source metadata for %s", skill_md, exc_info=True)
+
+
 # =============================================================================
 # Core actions
 # =============================================================================
 
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+def _create_skill(
+    name: str,
+    content: str,
+    category: str = None,
+    session_id: str = None,
+) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
     err = _validate_name(name)
@@ -303,6 +352,12 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "success": False,
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
+
+    content = _prepare_skill_content_with_metadata(
+        content,
+        session_id=session_id,
+        created_at_default=skill_timestamp_now(),
+    )
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
@@ -333,7 +388,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     return result
 
 
-def _edit_skill(name: str, content: str) -> Dict[str, Any]:
+def _edit_skill(name: str, content: str, session_id: str = None) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
     err = _validate_frontmatter(content)
     if err:
@@ -350,6 +405,13 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+    original_frontmatter = parse_frontmatter(original_content)[0] if original_content else {}
+    content = _prepare_skill_content_with_metadata(
+        content,
+        fallback_frontmatter=original_frontmatter,
+        session_id=session_id,
+        created_at_default=SKILL_CREATED_AT_UNKNOWN,
+    )
     _atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block
@@ -372,6 +434,7 @@ def _patch_skill(
     new_string: str,
     file_path: str = None,
     replace_all: bool = False,
+    session_id: str = None,
 ) -> Dict[str, Any]:
     """Targeted find-and-replace within a skill file.
 
@@ -403,6 +466,7 @@ def _patch_skill(
         return {"success": False, "error": f"File not found: {target.relative_to(skill_dir)}"}
 
     content = target.read_text(encoding="utf-8")
+    original_frontmatter = parse_frontmatter(content)[0] if not file_path else {}
 
     # Use the same fuzzy matching engine as the file patch tool.
     # This handles whitespace normalization, indentation differences,
@@ -422,13 +486,7 @@ def _patch_skill(
             "file_preview": preview,
         }
 
-    # Check size limit on the result
-    target_label = "SKILL.md" if not file_path else file_path
-    err = _validate_content_size(new_content, label=target_label)
-    if err:
-        return {"success": False, "error": err}
-
-    # If patching SKILL.md, validate frontmatter is still intact
+    # If patching SKILL.md, validate frontmatter is still intact and preserve lifecycle metadata.
     if not file_path:
         err = _validate_frontmatter(new_content)
         if err:
@@ -436,6 +494,18 @@ def _patch_skill(
                 "success": False,
                 "error": f"Patch would break SKILL.md structure: {err}",
             }
+        new_content = _prepare_skill_content_with_metadata(
+            new_content,
+            fallback_frontmatter=original_frontmatter,
+            session_id=session_id,
+            created_at_default=SKILL_CREATED_AT_UNKNOWN,
+        )
+
+    # Check size limit on the final result
+    target_label = "SKILL.md" if not file_path else file_path
+    err = _validate_content_size(new_content, label=target_label)
+    if err:
+        return {"success": False, "error": err}
 
     original_content = content  # for rollback
     _atomic_write_text(target, new_content)
@@ -445,6 +515,9 @@ def _patch_skill(
     if scan_error:
         _atomic_write_text(target, original_content)
         return {"success": False, "error": scan_error}
+
+    if file_path:
+        _touch_skill_source_metadata(skill_dir, session_id)
 
     return {
         "success": True,
@@ -472,7 +545,12 @@ def _delete_skill(name: str) -> Dict[str, Any]:
     }
 
 
-def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
+def _write_file(
+    name: str,
+    file_path: str,
+    file_content: str,
+    session_id: str = None,
+) -> Dict[str, Any]:
     """Add or overwrite a supporting file within any skill directory."""
     err = _validate_file_path(file_path)
     if err:
@@ -515,6 +593,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
             target.unlink(missing_ok=True)
         return {"success": False, "error": scan_error}
 
+    _touch_skill_source_metadata(existing["path"], session_id)
+
     return {
         "success": True,
         "message": f"File '{file_path}' written to skill '{name}'.",
@@ -522,7 +602,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     }
 
 
-def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
+def _remove_file(name: str, file_path: str, session_id: str = None) -> Dict[str, Any]:
     """Remove a supporting file from any skill directory."""
     err = _validate_file_path(file_path)
     if err:
@@ -556,6 +636,8 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     if parent != skill_dir and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
 
+    _touch_skill_source_metadata(skill_dir, session_id)
+
     return {
         "success": True,
         "message": f"File '{file_path}' removed from skill '{name}'.",
@@ -576,6 +658,7 @@ def skill_manage(
     old_string: str = None,
     new_string: str = None,
     replace_all: bool = False,
+    session_id: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -585,19 +668,19 @@ def skill_manage(
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+        result = _create_skill(name, content, category, session_id=session_id)
 
     elif action == "edit":
         if not content:
             return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
-        result = _edit_skill(name, content)
+        result = _edit_skill(name, content, session_id=session_id)
 
     elif action == "patch":
         if not old_string:
             return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
         if new_string is None:
             return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        result = _patch_skill(name, old_string, new_string, file_path, replace_all, session_id=session_id)
 
     elif action == "delete":
         result = _delete_skill(name)
@@ -607,12 +690,12 @@ def skill_manage(
             return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
         if file_content is None:
             return tool_error("file_content is required for 'write_file'.", success=False)
-        result = _write_file(name, file_path, file_content)
+        result = _write_file(name, file_path, file_content, session_id=session_id)
 
     elif action == "remove_file":
         if not file_path:
             return tool_error("file_path is required for 'remove_file'.", success=False)
-        result = _remove_file(name, file_path)
+        result = _remove_file(name, file_path, session_id=session_id)
 
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
@@ -737,6 +820,7 @@ registry.register(
         file_content=args.get("file_content"),
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False)),
+        replace_all=args.get("replace_all", False),
+        session_id=kw.get("session_id") or kw.get("task_id")),
     emoji="📝",
 )

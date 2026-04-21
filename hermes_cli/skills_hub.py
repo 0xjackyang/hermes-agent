@@ -597,7 +597,203 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
     c.print(f"[bold green]Updated {len(updates)} skill(s).[/]\n")
 
 
-def do_audit(name: Optional[str] = None, console: Optional[Console] = None) -> None:
+def _format_cell(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def _get_flag_int(args: list[str], flag: str, default: int) -> int:
+    if flag not in args:
+        return default
+    idx = args.index(flag)
+    if idx + 1 >= len(args):
+        return default
+    try:
+        return int(args[idx + 1])
+    except ValueError:
+        return default
+
+
+def _print_rows_table(
+    console: Console,
+    title: str,
+    rows: list[dict[str, Any]],
+    columns: list[tuple[str, str]],
+) -> None:
+    if not rows:
+        return
+    table = Table(title=title)
+    for _, label in columns:
+        table.add_column(label)
+    for row in rows:
+        table.add_row(*(_format_cell(row.get(key, "")) for key, _ in columns))
+    console.print(table)
+    console.print()
+
+
+def _render_lifecycle_audit(audit: dict[str, Any], console: Console) -> None:
+    summary = audit["summary"]
+    summary_table = Table(title="Skill Lifecycle Audit")
+    summary_table.add_column("Metric", style="bold cyan")
+    summary_table.add_column("Value", justify="right")
+    summary_table.add_row("Total skills", str(summary["total_skills"]))
+    summary_table.add_row("Metadata coverage", f"{summary['metadata_coverage_pct']}%")
+    summary_table.add_row("Unobserved", str(summary["unobserved"]))
+    summary_table.add_row(f"Stale (>{summary['stale_days_threshold']}d)", str(summary["stale"]))
+    summary_table.add_row("Deprecated/archived", str(summary["dead"]))
+    summary_table.add_row("Bloated", str(summary["bloated"]))
+    summary_table.add_row("Metadata gaps", str(summary["metadata_gaps"]))
+    summary_table.add_row("Exact duplicate groups", str(summary["exact_duplicate_groups"]))
+    summary_table.add_row("Near duplicate pairs", str(summary["near_duplicate_pairs"]))
+    summary_table.add_row("Parse errors", str(summary["parse_errors"]))
+    console.print(summary_table)
+    console.print()
+
+    _print_rows_table(
+        console,
+        "Metadata gaps",
+        audit["metadata_gaps"],
+        [("name", "Name"), ("missing_fields", "Missing fields"), ("path", "Path")],
+    )
+    _print_rows_table(
+        console,
+        "Unobserved skills",
+        audit["unobserved"],
+        [("name", "Name"), ("status", "Status"), ("path", "Path")],
+    )
+    _print_rows_table(
+        console,
+        f"Stale skills (>{summary['stale_days_threshold']}d)",
+        audit["stale"],
+        [("name", "Name"), ("age_days", "Age (days)"), ("last_used_at", "Last used"), ("path", "Path")],
+    )
+    _print_rows_table(
+        console,
+        "Deprecated / archived skills",
+        audit["dead"],
+        [("name", "Name"), ("status", "Status"), ("path", "Path")],
+    )
+    _print_rows_table(
+        console,
+        "Bloated skills",
+        audit["bloated"],
+        [("name", "Name"), ("line_count", "Lines"), ("estimated_tokens", "~Tokens"), ("reasons", "Reasons")],
+    )
+    _print_rows_table(
+        console,
+        "Skill parse errors",
+        audit["parse_errors"],
+        [("name", "Name"), ("error", "Error"), ("path", "Path")],
+    )
+
+    exact_groups = audit["duplicates"]["exact_groups"]
+    if exact_groups:
+        exact_table = Table(title="Exact duplicate groups")
+        exact_table.add_column("Count", justify="right")
+        exact_table.add_column("Skills")
+        exact_table.add_column("Paths")
+        for group in exact_groups:
+            exact_table.add_row(
+                str(group["count"]),
+                ", ".join(item["name"] for item in group["skills"]),
+                "\n".join(item["path"] for item in group["skills"]),
+            )
+        console.print(exact_table)
+        console.print()
+
+    near_pairs = audit["duplicates"]["near_pairs"]
+    if near_pairs:
+        near_table = Table(title="Near-duplicate candidates")
+        near_table.add_column("Left")
+        near_table.add_column("Right")
+        near_table.add_column("Score", justify="right")
+        near_table.add_column("Signals")
+        for pair in near_pairs:
+            near_table.add_row(
+                pair["left"]["name"],
+                pair["right"]["name"],
+                str(pair["score"]),
+                f"name={pair['name_similarity']}, tokens={pair['token_overlap']}, text={pair['text_similarity']}",
+            )
+        console.print(near_table)
+        console.print()
+
+
+def do_audit(
+    name: Optional[str] = None,
+    console: Optional[Console] = None,
+    json_output: bool = False,
+    stale_days: int = 90,
+) -> None:
+    """Audit installed skills for lifecycle metadata, freshness, duplicates, and bloat."""
+    from agent.skill_lifecycle import build_skill_audit, collect_skill_inventory
+
+    c = console or _console
+    records = collect_skill_inventory()
+    if name:
+        records = [record for record in records if record.get("name") == name]
+        if not records:
+            c.print(f"[bold red]Error:[/] Skill '{name}' not found in installed skills.\n")
+            return
+
+    if not records:
+        c.print("[dim]No installed skills to audit.[/]\n")
+        return
+
+    audit = build_skill_audit(records, stale_days=stale_days)
+    if json_output:
+        c.print(json.dumps(audit, indent=2, ensure_ascii=False))
+        return
+
+    _render_lifecycle_audit(audit, c)
+
+
+def do_health(
+    console: Optional[Console] = None,
+    json_output: bool = False,
+    stale_days: int = 90,
+) -> None:
+    """Summarize overall skill health from the lifecycle audit surface."""
+    from agent.skill_lifecycle import build_skill_health_report, collect_skill_inventory
+
+    c = console or _console
+    records = collect_skill_inventory()
+    if not records:
+        c.print("[dim]No installed skills to assess.[/]\n")
+        return
+
+    health = build_skill_health_report(records, stale_days=stale_days)
+    if json_output:
+        c.print(json.dumps(health, indent=2, ensure_ascii=False))
+        return
+
+    summary = health["summary"]
+    panel = Panel(
+        "\n".join(
+            [
+                f"[bold]Status:[/] {health['overall_status']}",
+                f"[bold]Coverage:[/] {summary['metadata_coverage_pct']}% lifecycle metadata present",
+                f"[bold]Observed / unobserved:[/] {summary['total_skills'] - summary['unobserved']} / {summary['unobserved']}",
+                f"[bold]Duplicates:[/] {summary['exact_duplicate_groups']} exact groups, {summary['near_duplicate_pairs']} near pairs",
+                f"[bold]Bloated:[/] {summary['bloated']}",
+                f"[bold]Stale:[/] {summary['stale']} over {summary['stale_days_threshold']}d",
+            ]
+        ),
+        title="Skill Health",
+    )
+    c.print(panel)
+    c.print()
+
+    issues_table = Table(title="Top issues")
+    issues_table.add_column("Observation", style="bold cyan")
+    for issue in health["top_issues"]:
+        issues_table.add_row(issue)
+    c.print(issues_table)
+    c.print()
+
+
+def do_security_audit(name: Optional[str] = None, console: Optional[Console] = None) -> None:
     """Re-run security scan on installed hub skills."""
     from tools.skills_hub import HubLockFile, SKILLS_DIR
     from tools.skills_guard import scan_skill, format_scan_report
@@ -617,7 +813,7 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None) -> N
             c.print(f"[bold red]Error:[/] '{name}' is not a hub-installed skill.\n")
             return
 
-    c.print(f"\n[bold]Auditing {len(targets)} skill(s)...[/]\n")
+    c.print(f"\n[bold]Auditing {len(targets)} hub skill(s) for security...[/]\n")
 
     for entry in targets:
         skill_path = SKILLS_DIR / entry["install_path"]
@@ -985,7 +1181,18 @@ def skills_command(args) -> None:
     elif action == "update":
         do_update(name=getattr(args, "name", None))
     elif action == "audit":
-        do_audit(name=getattr(args, "name", None))
+        do_audit(
+            name=getattr(args, "name", None),
+            json_output=getattr(args, "json", False),
+            stale_days=getattr(args, "stale_days", 90),
+        )
+    elif action == "health":
+        do_health(
+            json_output=getattr(args, "json", False),
+            stale_days=getattr(args, "stale_days", 90),
+        )
+    elif action == "security-audit":
+        do_security_audit(name=getattr(args, "name", None))
     elif action == "uninstall":
         do_uninstall(args.name)
     elif action == "publish":
@@ -1032,7 +1239,9 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         /skills check
         /skills update
         /skills audit
-        /skills audit my-skill
+        /skills audit my-skill --json
+        /skills health
+        /skills security-audit my-skill
         /skills uninstall my-skill
         /skills tap list
         /skills tap add owner/repo
@@ -1143,8 +1352,36 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         do_update(name=name, console=c)
 
     elif action == "audit":
+        filtered_args: list[str] = []
+        skip_next = False
+        for idx, arg in enumerate(args):
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--stale-days":
+                skip_next = idx + 1 < len(args)
+                continue
+            if arg.startswith("-"):
+                continue
+            filtered_args.append(arg)
+        name = filtered_args[0] if filtered_args else None
+        do_audit(
+            name=name,
+            console=c,
+            json_output="--json" in args,
+            stale_days=_get_flag_int(args, "--stale-days", 90),
+        )
+
+    elif action == "health":
+        do_health(
+            console=c,
+            json_output="--json" in args,
+            stale_days=_get_flag_int(args, "--stale-days", 90),
+        )
+
+    elif action == "security-audit":
         name = args[0] if args else None
-        do_audit(name=name, console=c)
+        do_security_audit(name=name, console=c)
 
     elif action == "uninstall":
         if not args:
@@ -1210,7 +1447,9 @@ def _print_skills_help(console: Console) -> None:
         "  [cyan]list[/] [--source hub|builtin|local] List installed skills\n"
         "  [cyan]check[/] [name]                Check hub skills for upstream updates\n"
         "  [cyan]update[/] [name]               Update hub skills with upstream changes\n"
-        "  [cyan]audit[/] [name]                Re-scan hub skills for security\n"
+        "  [cyan]audit[/] [name] [--json]       Audit lifecycle metadata, staleness, duplicates, and bloat\n"
+        "  [cyan]health[/] [--json]             Show a compact skill health summary\n"
+        "  [cyan]security-audit[/] [name]       Re-scan hub skills for security\n"
         "  [cyan]uninstall[/] <name>            Remove a hub-installed skill\n"
         "  [cyan]publish[/] <path> --repo <r>   Publish a skill to GitHub via PR\n"
         "  [cyan]snapshot[/] export|import      Export/import skill configurations\n"
