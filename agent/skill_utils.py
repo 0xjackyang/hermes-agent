@@ -213,7 +213,7 @@ def normalize_skill_lifecycle_fields(
 
     status = _preferred_value("status")
     normalized_status = str(status).strip().lower() if status not in (None, "") else ""
-    if normalized_status not in VALID_SKILL_STATUSES:
+    if not normalized_status:
         normalized_status = SKILL_STATUS_ACTIVE
         missing_fields.append("status")
     if updated.get("status") != normalized_status:

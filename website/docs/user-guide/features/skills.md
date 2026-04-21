@@ -266,7 +266,9 @@ Hermes now tracks lightweight lifecycle fields in `SKILL.md` frontmatter so futu
 - `status` — one of `active`, `stale`, `deprecated`, or `archived`
 - `notability_score` — optional manual or future-tooling signal for unusually important skills
 
-Migration is lazy and backward-compatible: existing skills keep loading as-is, and missing lifecycle fields are backfilled with sentinel defaults the next time Hermes scans, loads, or rewrites the skill.
+Migration is lazy and backward-compatible: existing skills keep loading as-is, and missing lifecycle fields are backfilled with sentinel defaults the next time Hermes scans, loads, or rewrites the skill. Unknown future `status` values are preserved on touch so later pruning phases can extend the lifecycle model without older tooling flattening them back to `active`.
+
+`hermes skills audit` and `hermes skills health` are lifecycle/read-only operator surfaces. The older hub security meaning is still available via `hermes skills security-audit`.
 
 ## Skills Hub
 
@@ -289,6 +291,7 @@ hermes skills list --source hub                   # List hub-installed skills
 hermes skills check                               # Check installed hub skills for upstream updates
 hermes skills update                              # Reinstall hub skills with upstream changes when needed
 hermes skills audit                               # Audit lifecycle metadata, staleness, duplicates, and bloat
+hermes skills audit --json --stale-days 120       # Emit machine-readable audit output with a custom staleness threshold
 hermes skills health                              # Compact summary of overall skill lifecycle health
 hermes skills security-audit                      # Re-scan hub skills for security
 hermes skills uninstall k8s                       # Remove a hub skill

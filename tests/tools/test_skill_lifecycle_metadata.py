@@ -67,3 +67,19 @@ def test_skill_manage_create_and_edit_capture_source_session_ids(tmp_path):
     assert "last_used_at: never" in stored
     assert "session-create" in stored
     assert "session-edit" in stored
+
+
+def test_skill_view_preserves_unknown_future_status_values(tmp_path):
+    skill_dir = _write_skill(
+        tmp_path,
+        "future-status",
+        frontmatter_extra="status: merged\n",
+    )
+
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        result = json.loads(skill_view("future-status"))
+
+    assert result["success"] is True
+    assert result["status"] == "merged"
+    stored = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    assert "status: merged" in stored
