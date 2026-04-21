@@ -261,8 +261,8 @@ The `patch` action is preferred for updates — it's more token-efficient than `
 Hermes now tracks lightweight lifecycle fields in `SKILL.md` frontmatter so future pruning and consolidation can reason from actual usage rather than guesses:
 
 - `created_at` — ISO timestamp for newly-created skills, or the sentinel `unknown` for legacy skills that predate the lifecycle schema
-- `last_used_at` — updated when a skill is loaded via `skill_view` or slash-command skill loading; legacy untouched skills default to the sentinel `never`
-- `source_session_ids` — list of session/task provenance IDs captured on `skill_manage` writes
+- `last_used_at` — updated when a skill is explicitly loaded via `skill_view`, slash-command skill loading, or preloaded skills; legacy untouched skills default to the sentinel `never`. System-prompt advertising in `agent/prompt_builder.py` does **not** count as usage in Phase 2 audit semantics.
+- `source_session_ids` — list of session/task provenance IDs captured on `skill_manage` writes. On the tool-dispatched `skill_manage` path, this field may record task IDs when a session ID is unavailable.
 - `status` — one of `active`, `stale`, `deprecated`, or `archived`
 - `notability_score` — optional manual or future-tooling signal for unusually important skills
 

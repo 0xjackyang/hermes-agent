@@ -821,6 +821,9 @@ registry.register(
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
+        # handle_function_call() currently passes task_id but not a stable session_id
+        # on the generic tool-dispatch path, so provenance falls back to task_id
+        # until a later plumbing lane threads true session IDs through here.
         session_id=kw.get("session_id") or kw.get("task_id")),
     emoji="📝",
 )

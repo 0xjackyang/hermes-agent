@@ -648,6 +648,9 @@ def _render_lifecycle_audit(audit: dict[str, Any], console: Console) -> None:
     summary_table.add_row("Near duplicate pairs", str(summary["near_duplicate_pairs"]))
     summary_table.add_row("Parse errors", str(summary["parse_errors"]))
     console.print(summary_table)
+    console.print(
+        "[dim]Phase 2 note: 'unobserved' means never explicitly loaded via skill_view, slash-command skill loading, or preloaded skills. Skills advertised in the system-prompt index by prompt_builder do not count as 'used'.[/]"
+    )
     console.print()
 
     _print_rows_table(
