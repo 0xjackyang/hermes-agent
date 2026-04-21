@@ -31,3 +31,20 @@ not disappear after Patch 3C closes the current data-model invariants.
   multiple independent paths.
 - Fix direction: introduce a single turn-scoped lifecycle helper so safe,
   unsafe, replayed, and cleared transitions happen in one place.
+
+## Post-3D P3 nits
+
+1. `_build_recovery_fallback_payload` forwarding regression — implemented in
+   PR #3, shipped 2026-04-21.
+
+- Closeout: `_mark_turn_recovery_unsafe` now forwards `command_preview` or
+  `summary` as the synthetic fallback event text through
+  `TurnRecoveryHandle.from_store`, preserving pre-3D fallback semantics for
+  first-writer unsafe recovery paths.
+
+2. `message_id=None` same-turn detection collision — implemented in PR #3,
+   shipped 2026-04-21.
+
+- Closeout: `TurnRecoveryHandle.begin()` now requires non-`None` stamped
+  message IDs on both sides before carrying forward retry metadata, so no-id
+  turns cannot collide on text.
