@@ -112,18 +112,34 @@ git push -u origin HEAD
 
 **With gh:**
 
-```bash
-gh pr create \
-  --title "feat: add JWT-based user authentication" \
-  --body "## Summary
+Save the PR body to `pr-body.md` using your editor, file tools, or a host-appropriate shell command:
+
+```md
+## Summary
 - Adds login and register API endpoints
 - JWT token generation and validation
 
 ## Test Plan
 - [ ] Unit tests pass
 
-Closes #42"
+Closes #42
 ```
+
+Then create the PR:
+
+```
+gh pr create --title "feat: add JWT-based user authentication" --body-file pr-body.md
+```
+
+Prefer `--body-file` over inline `--body` for any non-trivial PR text. It avoids shell quoting bugs, especially when the body contains backticks, code spans, or multi-line markdown that can trigger command substitution or malformed text.
+
+If `gh pr edit` fails with a GraphQL error mentioning classic project cards (for example `repository.pullRequest.projectCards` deprecation), fall back to the REST API with `gh api` instead of retrying `gh pr edit`:
+
+```
+gh api "repos/OWNER/REPO/pulls/PR_NUMBER" --method PATCH -H "Accept: application/vnd.github+json" -F "body=@pr-body.md"
+```
+
+Replace `OWNER/REPO`, `PR_NUMBER`, and `pr-body.md` with your actual values. This form stays portable across bash, zsh, PowerShell, and Windows Claude Code hosts because it avoids `python3`, heredocs, and shell-specific JSON quoting.
 
 Options: `--draft`, `--reviewer user1,user2`, `--label "enhancement"`, `--base develop`
 
