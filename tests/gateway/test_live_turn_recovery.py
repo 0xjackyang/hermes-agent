@@ -46,12 +46,12 @@ def _source():
     )
 
 
-def _event(text="hello"):
+def _event(text="hello", message_id="m1"):
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=_source(),
-        message_id="m1",
+        message_id=message_id,
         timestamp=datetime.now(),
     )
 
@@ -122,6 +122,36 @@ def test_turn_recovery_handle_stages_followup_resets_replay_count_for_new_turn(t
 
     recovery = store.list_pending_recoveries()[0]["recovery"]
     assert recovery["event"]["text"] == "follow up"
+    assert recovery["resume_attempts"] == 0
+
+
+@pytest.mark.parametrize("second_text", ["repeatable prompt", "different prompt"])
+def test_turn_recovery_handle_resets_replay_count_when_message_id_missing(
+    tmp_path: Path,
+    second_text: str,
+):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    entry = store.get_or_create_session(source)
+    first_event = _event("repeatable prompt", message_id=None)
+    second_event = _event(second_text, message_id=None)
+
+    handle = TurnRecoveryHandle(
+        session_store=store,
+        session_key=entry.session_key,
+        session_id=entry.session_id,
+        source=source,
+        event=first_event,
+    )
+    handle.begin()
+    handle.mark_replayed()
+    handle.rebind(event=second_event)
+    handle.begin()
+
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["event"]["text"] == second_text
+    assert recovery["event"]["message_id"] is None
     assert recovery["resume_attempts"] == 0
 
 
@@ -299,6 +329,54 @@ async def test_gateway_skips_tool_interrupted_turn_and_notifies(tmp_path: Path):
     assert adapter.sent
     assert "tool was running" in adapter.sent[0][1]
     assert store.list_pending_recoveries() == []
+
+
+def test_gateway_mark_turn_recovery_unsafe_uses_command_preview_as_fallback_text(
+    tmp_path: Path,
+):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    entry = store.get_or_create_session(source)
+    runner = _recovery_runner(store)
+
+    runner._mark_turn_recovery_unsafe(
+        entry.session_key,
+        recovery_kind="approval_pending",
+        summary="Dangerous command approval was pending: delete temp files",
+        command_preview="foo",
+        source=source,
+        session_id=entry.session_id,
+    )
+
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["unsafe_reason"] == "approval_pending"
+    assert recovery["command_preview"] == "foo"
+    assert recovery["event"]["text"] == "foo"
+    assert recovery["event"]["text"] != "interrupted turn"
+
+
+def test_gateway_mark_turn_recovery_unsafe_uses_summary_as_fallback_text(
+    tmp_path: Path,
+):
+    sessions_dir = tmp_path / "sessions"
+    store = SessionStore(sessions_dir, _config())
+    source = _source()
+    entry = store.get_or_create_session(source)
+    runner = _recovery_runner(store)
+    summary = "The turn was interrupted while tool `terminal` was running."
+
+    runner._mark_turn_recovery_unsafe(
+        entry.session_key,
+        recovery_kind="tool_execution_interrupted",
+        summary=summary,
+        source=source,
+        session_id=entry.session_id,
+    )
+
+    recovery = store.list_pending_recoveries()[0]["recovery"]
+    assert recovery["unsafe_reason"] == "tool_execution_interrupted"
+    assert recovery["event"]["text"] == summary
 
 
 def test_gateway_remember_pending_approval_upserts_missing_recovery(tmp_path: Path):

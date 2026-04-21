@@ -795,11 +795,13 @@ class GatewayRunner:
         session_id: Optional[str] = None,
         event: Optional[MessageEvent] = None,
     ) -> None:
+        fallback_text = command_preview or summary or "interrupted turn"
         handle = self._turn_recovery_handle(
             session_key,
             source=source,
             session_id=session_id,
             event=event,
+            fallback_text=fallback_text,
         )
         if handle is None:
             return
