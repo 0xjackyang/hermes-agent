@@ -256,6 +256,20 @@ The agent can create, update, and delete its own skills via the `skill_manage` t
 The `patch` action is preferred for updates — it's more token-efficient than `edit` because only the changed text appears in the tool call.
 :::
 
+## Skill lifecycle metadata
+
+Hermes now tracks lightweight lifecycle fields in `SKILL.md` frontmatter so future pruning and consolidation can reason from actual usage rather than guesses:
+
+- `created_at` — ISO timestamp for newly-created skills, or the sentinel `unknown` for legacy skills that predate the lifecycle schema
+- `last_used_at` — updated when a skill is explicitly loaded via `skill_view`, slash-command skill loading, or preloaded skills; legacy untouched skills default to the sentinel `never`. System-prompt advertising in `agent/prompt_builder.py` does **not** count as usage in Phase 2 audit semantics.
+- `source_session_ids` — list of session/task provenance IDs captured on `skill_manage` writes. On the tool-dispatched `skill_manage` path, this field may record task IDs when a session ID is unavailable.
+- `status` — one of `active`, `stale`, `deprecated`, or `archived`
+- `notability_score` — optional manual or future-tooling signal for unusually important skills
+
+Migration is lazy and backward-compatible: existing skills keep loading as-is, and missing lifecycle fields are backfilled with sentinel defaults the next time Hermes scans, loads, or rewrites the skill. Unknown future `status` values are preserved on touch so later pruning phases can extend the lifecycle model without older tooling flattening them back to `active`.
+
+`hermes skills audit` and `hermes skills health` are lifecycle/read-only operator surfaces. The older hub security meaning is still available via `hermes skills security-audit`.
+
 ## Skills Hub
 
 Browse, search, install, and manage skills from online registries, `skills.sh`, direct well-known skill endpoints, and official optional skills.
@@ -276,7 +290,10 @@ hermes skills install well-known:https://mintlify.com/docs/.well-known/skills/mi
 hermes skills list --source hub                   # List hub-installed skills
 hermes skills check                               # Check installed hub skills for upstream updates
 hermes skills update                              # Reinstall hub skills with upstream changes when needed
-hermes skills audit                               # Re-scan all hub skills for security
+hermes skills audit                               # Audit lifecycle metadata, staleness, duplicates, and bloat
+hermes skills audit --json --stale-days 120       # Emit machine-readable audit output with a custom staleness threshold
+hermes skills health                              # Compact summary of overall skill lifecycle health
+hermes skills security-audit                      # Re-scan hub skills for security
 hermes skills uninstall k8s                       # Remove a hub skill
 hermes skills publish skills/my-skill --to github --repo owner/repo
 hermes skills snapshot export setup.json          # Export skill config

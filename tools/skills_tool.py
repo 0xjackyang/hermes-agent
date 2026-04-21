@@ -421,29 +421,15 @@ def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
 
 
 def _get_category_from_path(skill_path: Path) -> Optional[str]:
-    """
-    Extract category from skill path based on directory structure.
+    """Extract category from skill path based on directory structure."""
+    from agent.skill_utils import get_category_from_skill_path, get_external_skills_dirs
 
-    For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
-    Also works for external skill dirs configured via skills.external_dirs.
-    """
-    # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
-    # then fall back to external dirs from config.
     dirs_to_check = [SKILLS_DIR]
     try:
-        from agent.skill_utils import get_external_skills_dirs
         dirs_to_check.extend(get_external_skills_dirs())
     except Exception:
         pass
-    for skills_dir in dirs_to_check:
-        try:
-            rel_path = skill_path.relative_to(skills_dir)
-            parts = rel_path.parts
-            if len(parts) >= 3:
-                return parts[0]
-        except ValueError:
-            continue
-    return None
+    return get_category_from_skill_path(skill_path, skills_dirs=dirs_to_check)
 
 
 def _estimate_tokens(content: str) -> int:
@@ -550,7 +536,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             skill_dir = skill_md.parent
 
             try:
-                content = skill_md.read_text(encoding="utf-8")[:4000]
+                from agent.skill_utils import sync_skill_lifecycle_metadata
+
+                sync_result = sync_skill_lifecycle_metadata(skill_md, persist=True)
+                content = str(sync_result.get("content") or "")[:4000]
                 frontmatter, body = _parse_frontmatter(content)
 
                 if not skill_matches_platform(frontmatter):
@@ -862,9 +851,16 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Read the file once — reused for platform check and main content below
+        # Read and normalize the file once — reused for platform check and main content below.
         try:
-            content = skill_md.read_text(encoding="utf-8")
+            from agent.skill_utils import sync_skill_lifecycle_metadata
+
+            sync_result = sync_skill_lifecycle_metadata(
+                skill_md,
+                mark_used=True,
+                persist=True,
+            )
+            content = str(sync_result.get("content") or "")
         except Exception as e:
             return json.dumps(
                 {
@@ -1203,6 +1199,11 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             "success": True,
             "name": skill_name,
             "description": frontmatter.get("description", ""),
+            "created_at": frontmatter.get("created_at"),
+            "last_used_at": frontmatter.get("last_used_at"),
+            "source_session_ids": list(frontmatter.get("source_session_ids") or []),
+            "status": frontmatter.get("status"),
+            "notability_score": frontmatter.get("notability_score"),
             "tags": tags,
             "related_skills": related_skills,
             "content": content,

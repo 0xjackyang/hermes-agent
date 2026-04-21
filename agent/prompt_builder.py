@@ -475,6 +475,10 @@ def _build_snapshot_entry(
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
 
+    This path is for system-prompt skill indexing only. It intentionally does
+    not mutate lifecycle metadata: in Phase 2 audit semantics, prompt-builder
+    advertisement is visible availability, not proof of explicit use.
+
     Returns (is_compatible, frontmatter, description). On any error, returns
     (True, {}, "") to err on the side of showing the skill.
     """

@@ -9,8 +9,10 @@ import logging
 import os
 import re
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
 
@@ -29,6 +31,7 @@ EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub"))
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
 
 _yaml_load_fn = None
+_yaml_dump_fn = None
 
 
 def yaml_load(content: str):
@@ -44,6 +47,27 @@ def yaml_load(content: str):
 
         _yaml_load_fn = _load
     return _yaml_load_fn(content)
+
+
+def yaml_dump(value: Dict[str, Any]) -> str:
+    """Dump YAML with lazy import and stable key order."""
+    global _yaml_dump_fn
+    if _yaml_dump_fn is None:
+        import yaml
+
+        dumper = getattr(yaml, "CSafeDumper", None) or yaml.SafeDumper
+
+        def _dump(payload: Dict[str, Any]) -> str:
+            return yaml.dump(
+                payload,
+                Dumper=dumper,
+                sort_keys=False,
+                allow_unicode=True,
+                default_flow_style=False,
+            )
+
+        _yaml_dump_fn = _dump
+    return _yaml_dump_fn(value)
 
 
 # ── Frontmatter parsing ──────────────────────────────────────────────────
@@ -84,6 +108,224 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
             frontmatter[key.strip()] = value.strip()
 
     return frontmatter, body
+
+
+# ── Lifecycle metadata ────────────────────────────────────────────────────
+
+SKILL_CREATED_AT_UNKNOWN = "unknown"
+SKILL_LAST_USED_AT_NEVER = "never"
+SKILL_STATUS_ACTIVE = "active"
+SKILL_STATUS_STALE = "stale"
+SKILL_STATUS_DEPRECATED = "deprecated"
+SKILL_STATUS_ARCHIVED = "archived"
+VALID_SKILL_STATUSES = frozenset(
+    {
+        SKILL_STATUS_ACTIVE,
+        SKILL_STATUS_STALE,
+        SKILL_STATUS_DEPRECATED,
+        SKILL_STATUS_ARCHIVED,
+    }
+)
+
+
+def skill_timestamp_now(now: Optional[datetime] = None) -> str:
+    """Return an ISO-8601 UTC timestamp for skill metadata fields."""
+    current = now.astimezone(timezone.utc) if now else datetime.now(timezone.utc)
+    return current.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_skill_lifecycle_timestamp(value: Any) -> Optional[datetime]:
+    """Parse a lifecycle timestamp, returning None for sentinel values."""
+    if value in (None, "", SKILL_CREATED_AT_UNKNOWN, SKILL_LAST_USED_AT_NEVER):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _coerce_source_session_ids(value: Any) -> List[str]:
+    """Normalize source_session_ids to a clean string list."""
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def normalize_skill_lifecycle_fields(
+    frontmatter: Dict[str, Any],
+    *,
+    fallback_frontmatter: Optional[Dict[str, Any]] = None,
+    created_at_default: str = SKILL_CREATED_AT_UNKNOWN,
+    last_used_default: str = SKILL_LAST_USED_AT_NEVER,
+    source_session_id: Optional[str] = None,
+    mark_used: bool = False,
+    now: Optional[datetime] = None,
+) -> Tuple[Dict[str, Any], bool, List[str]]:
+    """Ensure lifecycle metadata fields exist with stable defaults.
+
+    Returns ``(updated_frontmatter, changed, missing_fields_before_fill)``.
+    Missing values are seeded from ``fallback_frontmatter`` when available,
+    otherwise from the provided defaults.
+    """
+    fallback_frontmatter = fallback_frontmatter or {}
+    updated = dict(frontmatter)
+    changed = False
+    missing_fields: List[str] = []
+
+    def _preferred_value(key: str):
+        current = updated.get(key)
+        if current not in (None, "", []):
+            return current
+        return fallback_frontmatter.get(key)
+
+    created_at = _preferred_value("created_at")
+    if created_at in (None, ""):
+        created_at = created_at_default
+        missing_fields.append("created_at")
+    if updated.get("created_at") != created_at:
+        updated["created_at"] = created_at
+        changed = True
+
+    if mark_used:
+        last_used_at = skill_timestamp_now(now)
+    else:
+        last_used_at = _preferred_value("last_used_at")
+        if last_used_at in (None, ""):
+            last_used_at = last_used_default
+            missing_fields.append("last_used_at")
+    if updated.get("last_used_at") != last_used_at:
+        updated["last_used_at"] = last_used_at
+        changed = True
+
+    session_ids = _coerce_source_session_ids(_preferred_value("source_session_ids"))
+    if not session_ids:
+        missing_fields.append("source_session_ids")
+    if source_session_id and source_session_id not in session_ids:
+        session_ids.append(source_session_id)
+    if updated.get("source_session_ids") != session_ids:
+        updated["source_session_ids"] = session_ids
+        changed = True
+
+    status = _preferred_value("status")
+    normalized_status = str(status).strip().lower() if status not in (None, "") else ""
+    if not normalized_status:
+        normalized_status = SKILL_STATUS_ACTIVE
+        missing_fields.append("status")
+    if updated.get("status") != normalized_status:
+        updated["status"] = normalized_status
+        changed = True
+
+    if "notability_score" not in updated and "notability_score" in fallback_frontmatter:
+        updated["notability_score"] = fallback_frontmatter["notability_score"]
+        changed = True
+
+    return updated, changed, missing_fields
+
+
+def serialize_skill_content(frontmatter: Dict[str, Any], body: str) -> str:
+    """Render a SKILL.md document from parsed frontmatter + markdown body."""
+    yaml_content = yaml_dump(frontmatter).strip()
+    stripped_body = body.lstrip("\n")
+    if stripped_body:
+        return f"---\n{yaml_content}\n---\n\n{stripped_body}"
+    return f"---\n{yaml_content}\n---\n"
+
+
+def apply_skill_lifecycle_to_content(
+    content: str,
+    *,
+    fallback_frontmatter: Optional[Dict[str, Any]] = None,
+    created_at_default: str = SKILL_CREATED_AT_UNKNOWN,
+    last_used_default: str = SKILL_LAST_USED_AT_NEVER,
+    source_session_id: Optional[str] = None,
+    mark_used: bool = False,
+    now: Optional[datetime] = None,
+) -> Tuple[str, Dict[str, Any], bool, List[str]]:
+    """Apply lifecycle metadata defaults to a raw SKILL.md document."""
+    if not content.startswith("---"):
+        return content, {}, False, []
+
+    frontmatter, body = parse_frontmatter(content)
+    updated_frontmatter, changed, missing_fields = normalize_skill_lifecycle_fields(
+        frontmatter,
+        fallback_frontmatter=fallback_frontmatter,
+        created_at_default=created_at_default,
+        last_used_default=last_used_default,
+        source_session_id=source_session_id,
+        mark_used=mark_used,
+        now=now,
+    )
+    if not changed:
+        return content, updated_frontmatter, False, missing_fields
+    return (
+        serialize_skill_content(updated_frontmatter, body),
+        updated_frontmatter,
+        True,
+        missing_fields,
+    )
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomically rewrite a text file in place."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.tmp.",
+        suffix="",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            logger.debug("Failed to clean up temporary skill metadata file %s", temp_path, exc_info=True)
+        raise
+
+
+def sync_skill_lifecycle_metadata(
+    skill_file: Path,
+    *,
+    fallback_frontmatter: Optional[Dict[str, Any]] = None,
+    created_at_default: str = SKILL_CREATED_AT_UNKNOWN,
+    last_used_default: str = SKILL_LAST_USED_AT_NEVER,
+    source_session_id: Optional[str] = None,
+    mark_used: bool = False,
+    persist: bool = True,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Normalize lifecycle metadata for a skill file and optionally persist it."""
+    raw_content = skill_file.read_text(encoding="utf-8")
+    new_content, frontmatter, changed, missing_fields = apply_skill_lifecycle_to_content(
+        raw_content,
+        fallback_frontmatter=fallback_frontmatter,
+        created_at_default=created_at_default,
+        last_used_default=last_used_default,
+        source_session_id=source_session_id,
+        mark_used=mark_used,
+        now=now,
+    )
+    persisted = False
+    if changed and persist:
+        try:
+            _atomic_write_text(skill_file, new_content)
+            persisted = True
+        except Exception:
+            logger.debug("Could not persist lifecycle metadata for %s", skill_file, exc_info=True)
+    return {
+        "content": new_content if changed else raw_content,
+        "frontmatter": frontmatter,
+        "changed": changed,
+        "persisted": persisted,
+        "metadata_missing_fields": missing_fields,
+    }
 
 
 # ── Platform matching ─────────────────────────────────────────────────────
@@ -440,3 +682,32 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             matches.append(Path(root) / filename)
     for path in sorted(matches, key=lambda p: str(p.relative_to(skills_dir))):
         yield path
+
+
+def iter_all_skill_index_files(filename: str = "SKILL.md"):
+    """Yield skill index files from the local skills dir and configured externals."""
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.is_dir():
+            continue
+        yield from iter_skill_index_files(skills_dir, filename)
+
+
+# ── Category helpers ───────────────────────────────────────────────────────
+
+
+def get_category_from_skill_path(
+    skill_path: Path,
+    *,
+    skills_dirs: Optional[List[Path]] = None,
+) -> Optional[str]:
+    """Extract the category segment from a skill path when present."""
+    dirs_to_check = skills_dirs or get_all_skills_dirs()
+    for skills_dir in dirs_to_check:
+        try:
+            rel_path = skill_path.relative_to(skills_dir)
+            parts = rel_path.parts
+            if len(parts) >= 3:
+                return parts[0]
+        except ValueError:
+            continue
+    return None

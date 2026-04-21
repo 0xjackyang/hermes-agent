@@ -222,7 +222,10 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                 if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
                     continue
                 try:
-                    content = skill_md.read_text(encoding='utf-8')
+                    from agent.skill_utils import sync_skill_lifecycle_metadata
+
+                    sync_result = sync_skill_lifecycle_metadata(skill_md, persist=True)
+                    content = str(sync_result.get("content") or "")
                     frontmatter, body = _parse_frontmatter(content)
                     # Skip skills incompatible with the current OS platform
                     if not skill_matches_platform(frontmatter):

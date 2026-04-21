@@ -264,6 +264,28 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_system_prompt_advertising_does_not_mark_skill_used(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "advertised-only"
+        skills_dir.mkdir(parents=True)
+        skill_md = skills_dir / "SKILL.md"
+        original = (
+            "---\n"
+            "name: advertised-only\n"
+            "description: Present in the skill index only.\n"
+            "created_at: unknown\n"
+            "last_used_at: never\n"
+            "source_session_ids: []\n"
+            "status: active\n"
+            "---\n"
+        )
+        skill_md.write_text(original)
+
+        result = build_skills_system_prompt()
+
+        assert "advertised-only" in result
+        assert skill_md.read_text() == original
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
