@@ -143,9 +143,13 @@ class TurnRecoveryHandle:
         existing = self.session_store.get_pending_recovery(self.session_key)
         if existing:
             existing_event = existing.get("event") or {}
+            existing_message_id = existing_event.get("message_id")
+            current_message_id = self.event.message_id
             same_turn = (
                 existing.get("session_id") == self.session_id
-                and existing_event.get("message_id") == self.event.message_id
+                and existing_message_id is not None
+                and current_message_id is not None
+                and existing_message_id == current_message_id
                 and existing_event.get("text") == self.event.text
             )
             if same_turn:
