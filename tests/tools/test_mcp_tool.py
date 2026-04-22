@@ -119,6 +119,37 @@ class TestSchemaConversion:
 
         assert schema["parameters"] == {"type": "object", "properties": {}}
 
+    def test_array_schema_without_items_gets_normalized_recursively(self):
+        from tools.mcp_tool import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(
+            name="log_ingest",
+            description="Log ingest event",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pages_updated": {"type": "array"},
+                    "nested": {
+                        "type": "object",
+                        "properties": {
+                            "tags": {"type": "array"},
+                        },
+                    },
+                },
+                "required": ["pages_updated"],
+            },
+        )
+        schema = _convert_mcp_schema("gbrain", mcp_tool)
+
+        assert schema["parameters"]["properties"]["pages_updated"] == {
+            "type": "array",
+            "items": {},
+        }
+        assert schema["parameters"]["properties"]["nested"]["properties"]["tags"] == {
+            "type": "array",
+            "items": {},
+        }
+
     def test_tool_name_prefix_format(self):
         from tools.mcp_tool import _convert_mcp_schema
 
