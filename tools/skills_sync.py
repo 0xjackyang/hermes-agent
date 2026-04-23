@@ -5,8 +5,11 @@ Skills Sync -- Manifest-based seeding and updating of bundled skills.
 Copies bundled skills from the repo's skills/ directory into ~/.hermes/skills/
 and uses a manifest to track which skills have been synced and their origin hash.
 
-Manifest format (v2): each line is "skill_name:origin_hash" where origin_hash
-is the MD5 of the bundled skill at the time it was last synced to the user dir.
+Manifest format:
+  - v2: each line is "skill_name:origin_hash" where origin_hash is the MD5
+    of the bundled skill at the time it was last synced to the user dir.
+  - v3: each line may append pipe-delimited flags after the hash as
+    "skill_name:origin_hash|flag1,flag2" for bounded seeding metadata.
 Old v1 manifests (plain names without hashes) are auto-migrated.
 
 Update logic:
@@ -32,6 +35,9 @@ from typing import Dict, List, Tuple
 logger = logging.getLogger(__name__)
 
 
+MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION = "protected_custom_collision"
+
+
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 MANIFEST_FILE = SKILLS_DIR / ".bundled_manifest"
@@ -51,10 +57,11 @@ def _get_bundled_dir() -> Path:
 
 def _read_manifest() -> Dict[str, str]:
     """
-    Read the manifest as a dict of {skill_name: origin_hash}.
+    Read the manifest as a dict of {skill_name: encoded_origin_record}.
 
-    Handles both v1 (plain names) and v2 (name:hash) formats.
-    v1 entries get an empty hash string which triggers migration on next sync.
+    Handles v1 (plain names), v2 (name:hash), and v3 (name:hash|flags)
+    formats. v1 entries get an empty hash string which triggers migration on
+    next sync.
     """
     if not MANIFEST_FILE.exists():
         return {}
@@ -77,7 +84,7 @@ def _read_manifest() -> Dict[str, str]:
 
 
 def _write_manifest(entries: Dict[str, str]):
-    """Write the manifest file atomically in v2 format (name:hash).
+    """Write the manifest file atomically in encoded manifest format.
 
     Uses a temp file + os.replace() to avoid corruption if the process
     crashes or is interrupted mid-write.
@@ -152,18 +159,80 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def _parse_manifest_entry(entry: str) -> tuple[str, set[str]]:
+    """Decode a manifest entry into its origin hash and any bounded flags."""
+
+    normalized = (entry or "").strip()
+    if not normalized:
+        return "", set()
+
+    origin_hash, sep, flags_blob = normalized.partition("|")
+    if not sep:
+        return origin_hash.strip(), set()
+
+    flags = {flag.strip() for flag in flags_blob.split(",") if flag.strip()}
+    return origin_hash.strip(), flags
+
+
+def _format_manifest_entry(origin_hash: str, *, flags: set[str] | None = None) -> str:
+    """Encode an origin hash and optional bounded flags for manifest storage."""
+
+    normalized_hash = (origin_hash or "").strip()
+    if not normalized_hash:
+        return ""
+
+    normalized_flags = sorted(
+        {flag.strip() for flag in (flags or set()) if flag and flag.strip()}
+    )
+    if not normalized_flags:
+        return normalized_hash
+    return f"{normalized_hash}|{','.join(normalized_flags)}"
+
+
+def _get_live_governed_skill_surface_context(skill_dir: Path) -> dict:
+    """Resolve governed-surface context for a bundled skill destination lazily."""
+    try:
+        from agent.skill_utils import get_live_governed_skill_surface_context
+
+        return get_live_governed_skill_surface_context(skill_dir / "SKILL.md")
+    except Exception:
+        logger.debug("Could not resolve governed skill-surface context for %s", skill_dir, exc_info=True)
+        return {
+            "applies": False,
+            "live_profile_base": False,
+            "tracked": False,
+            "reason": "context_lookup_failed",
+        }
+
+
+def _is_live_governed_tracked_skill_surface(skill_dir: Path) -> bool:
+    context = _get_live_governed_skill_surface_context(skill_dir)
+    return bool(context.get("live_profile_base") and context.get("tracked"))
+
+
+def _preserve_tracked_collision_off_live_base(manifest_flags: set[str], context: dict) -> bool:
+    """Keep protected tracked custom-skill collisions from later auto-overwrite."""
+
+    return bool(
+        MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION in manifest_flags
+        and context.get("applies")
+        and context.get("tracked")
+    )
+
+
 def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
 
     Returns:
-        dict with keys: copied (list), updated (list), skipped (int),
-                        user_modified (list), cleaned (list), total_bundled (int)
+        dict with keys: copied (list), updated (list), governed_skipped (list),
+                        skipped (int), user_modified (list), cleaned (list),
+                        total_bundled (int)
     """
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {
-            "copied": [], "updated": [], "skipped": 0,
+            "copied": [], "updated": [], "governed_skipped": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "total_bundled": 0,
         }
 
@@ -174,6 +243,7 @@ def sync_skills(quiet: bool = False) -> dict:
 
     copied = []
     updated = []
+    governed_skipped = []
     user_modified = []
     skipped = 0
 
@@ -185,14 +255,23 @@ def sync_skills(quiet: bool = False) -> dict:
             # ── New skill — never offered before ──
             try:
                 if dest.exists():
-                    # User already has a skill with the same name — don't overwrite
+                    # User already has a skill with the same name — don't overwrite.
+                    # On a live governed tracked surface, record the current on-disk
+                    # hash as a protected collision baseline so future branch-local
+                    # syncs do not later overwrite the tracked custom skill.
                     skipped += 1
-                    manifest[skill_name] = bundled_hash
+                    if _is_live_governed_tracked_skill_surface(dest):
+                        manifest[skill_name] = _format_manifest_entry(
+                            _dir_hash(dest),
+                            flags={MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION},
+                        )
+                    else:
+                        manifest[skill_name] = _format_manifest_entry(bundled_hash)
                 else:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(skill_src, dest)
                     copied.append(skill_name)
-                    manifest[skill_name] = bundled_hash
+                    manifest[skill_name] = _format_manifest_entry(bundled_hash)
                     if not quiet:
                         print(f"  + {skill_name}")
             except (OSError, IOError) as e:
@@ -202,13 +281,14 @@ def sync_skills(quiet: bool = False) -> dict:
 
         elif dest.exists():
             # ── Existing skill — in manifest AND on disk ──
-            origin_hash = manifest.get(skill_name, "")
+            origin_hash, manifest_flags = _parse_manifest_entry(manifest.get(skill_name, ""))
             user_hash = _dir_hash(dest)
+            skill_surface_context = None
 
             if not origin_hash:
                 # v1 migration: no origin hash recorded. Set baseline from
                 # user's current copy so future syncs can detect modifications.
-                manifest[skill_name] = user_hash
+                manifest[skill_name] = _format_manifest_entry(user_hash)
                 if user_hash == bundled_hash:
                     skipped += 1  # already in sync
                 else:
@@ -223,15 +303,43 @@ def sync_skills(quiet: bool = False) -> dict:
                     print(f"  ~ {skill_name} (user-modified, skipping)")
                 continue
 
+            if MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION in manifest_flags:
+                skill_surface_context = _get_live_governed_skill_surface_context(dest)
+                if bundled_hash == origin_hash:
+                    manifest[skill_name] = _format_manifest_entry(
+                        bundled_hash,
+                        flags=manifest_flags,
+                    )
+                elif _preserve_tracked_collision_off_live_base(
+                    manifest_flags,
+                    skill_surface_context,
+                ):
+                    skipped += 1
+                    if skill_surface_context.get("live_profile_base"):
+                        governed_skipped.append(skill_name)
+                        if not quiet:
+                            print(f"  = {skill_name} (live governed surface, keeping tracked custom skill)")
+                    elif not quiet:
+                        print(f"  = {skill_name} (tracked custom collision baseline, keeping)")
+                    continue
+
             # User copy matches origin — check if bundled has a newer version
             if bundled_hash != origin_hash:
+                if skill_surface_context is None:
+                    skill_surface_context = _get_live_governed_skill_surface_context(dest)
+                if skill_surface_context.get("live_profile_base") and skill_surface_context.get("tracked"):
+                    governed_skipped.append(skill_name)
+                    skipped += 1
+                    if not quiet:
+                        print(f"  = {skill_name} (live governed surface, skipping update)")
+                    continue
                 try:
                     # Move old copy to a backup so we can restore on failure
                     backup = dest.with_suffix(".bak")
                     shutil.move(str(dest), str(backup))
                     try:
                         shutil.copytree(skill_src, dest)
-                        manifest[skill_name] = bundled_hash
+                        manifest[skill_name] = _format_manifest_entry(bundled_hash)
                         updated.append(skill_name)
                         if not quiet:
                             print(f"  ↑ {skill_name} (updated)")
@@ -273,6 +381,7 @@ def sync_skills(quiet: bool = False) -> dict:
     return {
         "copied": copied,
         "updated": updated,
+        "governed_skipped": governed_skipped,
         "skipped": skipped,
         "user_modified": user_modified,
         "cleaned": cleaned,
@@ -290,6 +399,8 @@ if __name__ == "__main__":
     ]
     if result["user_modified"]:
         parts.append(f"{len(result['user_modified'])} user-modified (kept)")
+    if result["governed_skipped"]:
+        parts.append(f"{len(result['governed_skipped'])} governed tracked updates skipped")
     if result["cleaned"]:
         parts.append(f"{len(result['cleaned'])} cleaned from manifest")
     print(f"\nDone: {', '.join(parts)}. {result['total_bundled']} total bundled.")
