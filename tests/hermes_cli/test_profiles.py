@@ -8,6 +8,7 @@ and shell completion generation.
 import json
 import io
 import os
+import subprocess
 import tarfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -30,6 +31,7 @@ from hermes_cli.profiles import (
     import_profile,
     generate_bash_completion,
     generate_zsh_completion,
+    seed_profile_skills,
     _get_profiles_root,
     _get_default_hermes_home,
 )
@@ -178,6 +180,35 @@ class TestCreateProfile:
         assert not (profile_dir / "config.yaml").exists()
         assert not (profile_dir / ".env").exists()
         assert not (profile_dir / "SOUL.md").exists()
+
+    def test_seed_profile_skills_skips_live_governed_tracked_updates(self, profile_env, monkeypatch):
+        tmp_path = profile_env
+        bundled = tmp_path / "bundled_skills"
+        (bundled / "old-skill").mkdir(parents=True)
+        (bundled / "old-skill" / "SKILL.md").write_text("# Old", encoding="utf-8")
+
+        profile_dir = tmp_path / ".hermes" / "profiles" / "coder"
+        (profile_dir / "skills" / "old-skill").mkdir(parents=True)
+        (profile_dir / "skills" / "old-skill" / "SKILL.md").write_text("# Old v1", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=profile_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=profile_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=profile_dir, check=True, capture_output=True)
+        (profile_dir / "README.md").write_text("# coder profile\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=profile_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=profile_dir, check=True, capture_output=True)
+
+        from tools.skills_sync import _dir_hash
+
+        old_hash = _dir_hash(profile_dir / "skills" / "old-skill")
+        (profile_dir / "skills" / ".bundled_manifest").write_text(f"old-skill:{old_hash}\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(bundled))
+
+        result = seed_profile_skills(profile_dir, quiet=True)
+
+        assert result is not None
+        assert result["updated"] == []
+        assert result["governed_skipped"] == ["old-skill"]
+        assert (profile_dir / "skills" / "old-skill" / "SKILL.md").read_text(encoding="utf-8") == "# Old v1"
 
 
 # ===================================================================

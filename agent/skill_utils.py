@@ -8,6 +8,7 @@ tool registration or provider resolution.
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -288,6 +289,114 @@ def _atomic_write_text(path: Path, content: str) -> None:
         except OSError:
             logger.debug("Failed to clean up temporary skill metadata file %s", temp_path, exc_info=True)
         raise
+
+
+PROFILE_PROTECTED_BRANCHES = frozenset({"main", "master"})
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _git_repo_root(path_text: str) -> str:
+    if not path_text:
+        return ""
+    proc = subprocess.run(
+        ["git", "-C", path_text, "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def _git_current_branch(repo_root_text: str) -> str:
+    if not repo_root_text:
+        return ""
+    proc = subprocess.run(
+        ["git", "-C", repo_root_text, "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def _git_is_tracked(repo_root_text: str, relative_path_text: str) -> bool:
+    if not repo_root_text or not relative_path_text:
+        return False
+    proc = subprocess.run(
+        ["git", "-C", repo_root_text, "ls-files", "--error-unmatch", "--", relative_path_text],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def get_live_governed_skill_surface_context(target_path: Path) -> Dict[str, Any]:
+    """Describe whether ``target_path`` lands on a live governed profile skill surface.
+
+    The live governed surface is the current default/named profile checkout rooted at
+    ``HERMES_HOME`` when it is itself a git repo on a protected base branch.  In that
+    state, tracked skill paths are treated as governed canonical surfaces for bounded
+    startup sync / seeding decisions.
+    """
+
+    hermes_home = get_hermes_home().expanduser().resolve()
+    default_home = (Path.home() / ".hermes").expanduser().resolve()
+    skills_root = (hermes_home / "skills").resolve()
+    resolved_target = target_path.expanduser().resolve()
+
+    context: Dict[str, Any] = {
+        "applies": False,
+        "live_profile_base": False,
+        "tracked": False,
+        "hermes_home": str(hermes_home),
+        "skills_root": str(skills_root),
+        "repo_root": "",
+        "branch": "",
+        "relative_path": "",
+        "reason": "outside_profile_skills",
+    }
+
+    if not _path_is_relative_to(resolved_target, skills_root):
+        return context
+
+    context["relative_path"] = str(resolved_target.relative_to(hermes_home))
+
+    if hermes_home.parent.name != "profiles" and hermes_home != default_home:
+        context["reason"] = "hermes_home_not_live_profile_home"
+        return context
+
+    repo_root_text = _git_repo_root(str(hermes_home))
+    if not repo_root_text:
+        context["reason"] = "hermes_home_not_git_repo"
+        return context
+
+    repo_root = Path(repo_root_text)
+    context["repo_root"] = repo_root_text
+    if repo_root != hermes_home:
+        context["reason"] = "hermes_home_not_repo_root"
+        return context
+
+    branch = _git_current_branch(repo_root_text)
+    context["branch"] = branch
+    context["applies"] = True
+    context["tracked"] = _git_is_tracked(repo_root_text, context["relative_path"])
+
+    if branch not in PROFILE_PROTECTED_BRANCHES:
+        context["reason"] = "profile_repo_not_on_live_base_branch"
+        return context
+
+    context["live_profile_base"] = True
+    context["reason"] = "live_profile_base"
+    return context
 
 
 def sync_skill_lifecycle_metadata(

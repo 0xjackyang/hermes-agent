@@ -1,19 +1,46 @@
 """Tests for tools/skills_sync.py — manifest-based skill seeding and updating."""
 
+import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+from agent.skill_utils import get_live_governed_skill_surface_context
 from tools.skills_sync import (
-    _get_bundled_dir,
-    _read_manifest,
-    _write_manifest,
-    _discover_bundled_skills,
+    MANIFEST_FILE,
+    MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION,
+    SKILLS_DIR,
     _compute_relative_dest,
     _dir_hash,
+    _discover_bundled_skills,
+    _format_manifest_entry,
+    _get_bundled_dir,
+    _parse_manifest_entry,
+    _read_manifest,
+    _write_manifest,
     sync_skills,
-    MANIFEST_FILE,
-    SKILLS_DIR,
 )
+
+
+def _run_git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+
+def _init_live_profile_home(tmp_path: Path) -> Path:
+    profile_home = tmp_path / ".hermes" / "profiles" / "demo"
+    (profile_home / "skills").mkdir(parents=True, exist_ok=True)
+    _run_git(profile_home, "init")
+    _run_git(profile_home, "config", "user.email", "test@example.com")
+    _run_git(profile_home, "config", "user.name", "Test User")
+    (profile_home / "README.md").write_text("# demo profile\n", encoding="utf-8")
+    _run_git(profile_home, "add", "README.md")
+    _run_git(profile_home, "commit", "-m", "initial commit")
+    return profile_home
+
+
+def _commit_all(repo: Path, message: str) -> None:
+    _run_git(repo, "add", ".")
+    _run_git(repo, "commit", "-m", message)
 
 
 class TestReadWriteManifest:
@@ -34,6 +61,24 @@ class TestReadWriteManifest:
             result = _read_manifest()
 
         assert result == entries
+
+    def test_write_and_read_roundtrip_with_flags(self, tmp_path):
+        manifest_file = tmp_path / ".bundled_manifest"
+        entries = {
+            "skill-a": _format_manifest_entry(
+                "abc123",
+                flags={MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION},
+            )
+        }
+
+        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+            _write_manifest(entries)
+            result = _read_manifest()
+
+        assert result == entries
+        origin_hash, flags = _parse_manifest_entry(result["skill-a"])
+        assert origin_hash == "abc123"
+        assert flags == {MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION}
 
     def test_write_manifest_sorted(self, tmp_path):
         manifest_file = tmp_path / ".bundled_manifest"
@@ -373,7 +418,7 @@ class TestSyncSkills:
         with patch("tools.skills_sync._get_bundled_dir", return_value=tmp_path / "nope"):
             result = sync_skills(quiet=True)
         assert result == {
-            "copied": [], "updated": [], "skipped": 0,
+            "copied": [], "updated": [], "governed_skipped": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "total_bundled": 0,
         }
 
@@ -468,6 +513,144 @@ class TestSyncSkills:
         new_bundled_hash = _dir_hash(bundled / "old-skill")
         assert manifest["old-skill"] == new_bundled_hash
         assert manifest["old-skill"] != old_hash
+
+    def test_sync_skills_skips_updates_on_live_governed_tracked_profile_surface(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        profile_home = _init_live_profile_home(tmp_path)
+        skills_dir = profile_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        tracked_skill = skills_dir / "old-skill"
+        tracked_skill.mkdir(parents=True)
+        (tracked_skill / "SKILL.md").write_text("# Old v1", encoding="utf-8")
+        _commit_all(profile_home, "add tracked bundled skill")
+        old_hash = _dir_hash(tracked_skill)
+        manifest_file.write_text(f"old-skill:{old_hash}\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}), self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+            manifest = _read_manifest()
+
+        assert result["updated"] == []
+        assert result["governed_skipped"] == ["old-skill"]
+        assert (tracked_skill / "SKILL.md").read_text(encoding="utf-8") == "# Old v1"
+        assert manifest["old-skill"] == old_hash
+
+    def test_first_collision_protected_manifest_baseline_stays_preserved_off_live_base(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        profile_home = _init_live_profile_home(tmp_path)
+        skills_dir = profile_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        tracked_skill = skills_dir / "old-skill"
+        tracked_skill.mkdir(parents=True)
+        (tracked_skill / "SKILL.md").write_text("# My tracked custom skill", encoding="utf-8")
+        _commit_all(profile_home, "add tracked custom skill")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}), self._patches(bundled, skills_dir, manifest_file):
+            first_result = sync_skills(quiet=True)
+            manifest_after_first_sync = _read_manifest()
+            first_origin_hash, first_flags = _parse_manifest_entry(manifest_after_first_sync["old-skill"])
+            _run_git(profile_home, "checkout", "-b", "packet/worktree")
+            second_result = sync_skills(quiet=True)
+            manifest_after_second_sync = _read_manifest()
+            second_origin_hash, second_flags = _parse_manifest_entry(manifest_after_second_sync["old-skill"])
+
+        assert first_result["updated"] == []
+        assert first_result["governed_skipped"] == []
+        assert first_origin_hash == _dir_hash(tracked_skill)
+        assert first_flags == {MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION}
+        assert second_result["updated"] == []
+        assert second_result["governed_skipped"] == []
+        assert second_origin_hash == first_origin_hash
+        assert second_flags == {MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION}
+        assert (tracked_skill / "SKILL.md").read_text(encoding="utf-8") == "# My tracked custom skill"
+
+    def test_repeated_live_base_collision_rerun_keeps_flag_and_blocks_later_off_live_base_overwrite(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        profile_home = _init_live_profile_home(tmp_path)
+        skills_dir = profile_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        tracked_skill = skills_dir / "old-skill"
+        tracked_skill.mkdir(parents=True)
+        (tracked_skill / "SKILL.md").write_text("# Old", encoding="utf-8")
+        _commit_all(profile_home, "add tracked custom skill matching bundled contents")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}), self._patches(bundled, skills_dir, manifest_file):
+            first_result = sync_skills(quiet=True)
+            manifest_after_first_sync = _read_manifest()
+            first_origin_hash, first_flags = _parse_manifest_entry(manifest_after_first_sync["old-skill"])
+
+            second_result = sync_skills(quiet=True)
+            manifest_after_second_sync = _read_manifest()
+            second_origin_hash, second_flags = _parse_manifest_entry(manifest_after_second_sync["old-skill"])
+
+            _run_git(profile_home, "checkout", "-b", "packet/worktree")
+            (bundled / "old-skill" / "SKILL.md").write_text("# Old bundled v2", encoding="utf-8")
+
+            third_result = sync_skills(quiet=True)
+            manifest_after_third_sync = _read_manifest()
+            third_origin_hash, third_flags = _parse_manifest_entry(manifest_after_third_sync["old-skill"])
+
+        assert first_result["updated"] == []
+        assert first_result["governed_skipped"] == []
+        assert first_origin_hash == _dir_hash(tracked_skill)
+        assert first_flags == {MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION}
+
+        assert second_result["updated"] == []
+        assert second_result["governed_skipped"] == []
+        assert second_origin_hash == first_origin_hash
+        assert second_flags == {MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION}
+
+        assert third_result["updated"] == []
+        assert third_result["governed_skipped"] == []
+        assert third_origin_hash == first_origin_hash
+        assert third_flags == {MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION}
+        assert (tracked_skill / "SKILL.md").read_text(encoding="utf-8") == "# Old"
+
+    def test_sync_skills_updates_tracked_skill_off_live_base_branch(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        profile_home = _init_live_profile_home(tmp_path)
+        skills_dir = profile_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        tracked_skill = skills_dir / "old-skill"
+        tracked_skill.mkdir(parents=True)
+        (tracked_skill / "SKILL.md").write_text("# Old v1", encoding="utf-8")
+        _commit_all(profile_home, "add tracked bundled skill")
+        _run_git(profile_home, "checkout", "-b", "packet/worktree")
+        old_hash = _dir_hash(tracked_skill)
+        manifest_file.write_text(f"old-skill:{old_hash}\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}), self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert result["updated"] == ["old-skill"]
+        assert result["governed_skipped"] == []
+        assert (tracked_skill / "SKILL.md").read_text(encoding="utf-8") == "# Old"
+
+    def test_live_governed_skill_surface_context_tracks_branch_and_git_status(self, tmp_path):
+        profile_home = _init_live_profile_home(tmp_path)
+        skill_dir = profile_home / "skills" / "tracked-skill"
+        skill_dir.mkdir(parents=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("# tracked\n", encoding="utf-8")
+        _commit_all(profile_home, "add tracked skill")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}):
+            initial = get_live_governed_skill_surface_context(skill_md)
+            _run_git(profile_home, "checkout", "-b", "packet/worktree")
+            transitioned = get_live_governed_skill_surface_context(skill_md)
+
+        assert initial["applies"] is True
+        assert initial["live_profile_base"] is True
+        assert initial["tracked"] is True
+        assert initial["reason"] == "live_profile_base"
+        assert transitioned["applies"] is True
+        assert transitioned["live_profile_base"] is False
+        assert transitioned["tracked"] is True
+        assert transitioned["reason"] == "profile_repo_not_on_live_base_branch"
 
 
 class TestGetBundledDir:
