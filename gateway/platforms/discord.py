@@ -1697,9 +1697,15 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_voice(interaction: discord.Interaction, mode: str = ""):
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
 
-        @tree.command(name="update", description="Update Hermes Agent to the latest version")
-        async def slash_update(interaction: discord.Interaction):
-            await self._run_simple_slash(interaction, "/update", "Update initiated~")
+        # CSO-3: /update slash registration respects the CommandDef disable gate
+        # (see hermes_cli.commands — CommandDef("update", ..., gateway_disable_when_false=
+        # "gateway.enable_update_command")). Skips registration when the config
+        # explicitly sets gateway.enable_update_command: false.
+        from hermes_cli.commands import _resolve_disabled_gates
+        if "update" not in _resolve_disabled_gates():
+            @tree.command(name="update", description="Update Hermes Agent to the latest version")
+            async def slash_update(interaction: discord.Interaction):
+                await self._run_simple_slash(interaction, "/update", "Update initiated~")
 
         @tree.command(name="approve", description="Approve a pending dangerous command")
         @discord.app_commands.describe(scope="Optional: 'all', 'session', 'always', 'all session', 'all always'")
