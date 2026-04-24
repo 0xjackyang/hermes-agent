@@ -399,6 +399,10 @@ def create_profile(
         )
 
     profile_dir = get_profile_dir(name)
+    # Phase 3-C.2.4 governance gate (fires if profile_dir already exists AND is governed;
+    # new-profile import into a non-existent dir is harmless and skips the check).
+    if profile_dir.is_dir():
+        _check_governance_or_force(profile_dir, "import-overwrite profile", force)
     if profile_dir.exists():
         raise FileExistsError(f"Profile '{name}' already exists at {profile_dir}")
 
@@ -480,7 +484,70 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
         return None
 
 
-def delete_profile(name: str, yes: bool = False) -> Path:
+def _is_governed_profile_dir(profile_dir: Path) -> bool:
+    """Check whether profile_dir is itself a git repo on a protected branch.
+
+    Distinct from agent.skill_surface.is_governed_filesystem, which reads
+    the ambient HERMES_HOME. For profile-op governance (delete / import /
+    etc.), the target profile_dir may differ from the currently-active
+    profile — we need to inspect it directly, not via ambient state.
+
+    Protected branches: main, master (matches
+    PROFILE_PROTECTED_BRANCHES in agent/skill_utils.py).
+    """
+    import subprocess
+
+    if not (profile_dir / ".git").exists():
+        return False
+    try:
+        # repo root must equal profile_dir (not inside an ancestor repo)
+        root = subprocess.run(
+            ["git", "-C", str(profile_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if Path(root).resolve() != profile_dir.resolve():
+            return False
+        branch = subprocess.run(
+            ["git", "-C", str(profile_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    return branch in ("main", "master")
+
+
+def _check_governance_or_force(
+    profile_dir: Path,
+    op_label: str,
+    force: bool,
+) -> None:
+    """Phase 3-C.2.4: reject destructive profile ops on governed profiles
+    unless operator explicitly passes --force.
+
+    A "governed profile" here is one whose profile_dir is itself a git
+    repo on a protected branch (main/master). Ordinary operator-invoked
+    delete/import on such a profile bypasses explicit promotion
+    discipline; --force is the explicit acknowledgement that the
+    operator knows what they're doing.
+
+    Different risk class from the hidden-danger write-path gates in
+    agent/skill_surface.py::is_governed_target (those fire on silent
+    writes). This is operator UX: clear error + override path.
+    """
+    if not _is_governed_profile_dir(profile_dir):
+        return
+    if force:
+        return
+    raise ValueError(
+        f"Refusing to {op_label} '{profile_dir.name}' without --force: "
+        f"this profile is on a live governed surface (git repo on "
+        f"protected branch). Use --force to override, or follow the "
+        f"explicit promotion path (see "
+        f"0xsatorisan:playbooks/playbook-skill-learning-delta-terminal-outcomes.md "
+        f"and the profile's AGENTS.md)."
+    )
+
+def delete_profile(name: str, yes: bool = False, force: bool = False) -> Path:
     """Delete a profile, its wrapper script, and its gateway service.
 
     Stops the gateway if running. Disables systemd/launchd service first
@@ -499,6 +566,9 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     profile_dir = get_profile_dir(name)
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"Profile '{name}' does not exist.")
+
+    # Phase 3-C.2.4 governance gate
+    _check_governance_or_force(profile_dir, "delete profile", force)
 
     # Show what will be deleted
     model, provider = _read_config_model(profile_dir)
@@ -847,7 +917,7 @@ def _safe_extract_profile_archive(archive: Path, destination: Path) -> None:
                 pass
 
 
-def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
+def import_profile(archive_path: str, name: Optional[str] = None, force: bool = False) -> Path:
     """Import a profile from a tar.gz archive.
 
     If *name* is not given, infers it from the archive's top-level directory.
