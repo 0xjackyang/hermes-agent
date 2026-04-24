@@ -40,7 +40,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from agent.skill_surface import runtime_local_skill_root
+from agent.skill_surface import is_governed_target, runtime_local_skill_root
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -88,6 +88,33 @@ from agent.skill_utils import (
 # All skills live in ~/.hermes/skills/ (single source of truth)
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = runtime_local_skill_root()  # Phase 3-B: resolver-backed
+
+
+# ---------------------------------------------------------------------------
+# Phase 3-C.2.1 governance gate
+# ---------------------------------------------------------------------------
+
+
+def _reject_governed_write(target, op_label: str):
+    """Return an error dict when `target` is on a live governed canonical
+    skill surface (tracked file on protected branch). None when the write
+    may proceed.
+
+    Matches the existing skill_manager_tool error-dict style. Callers
+    short-circuit with ``if err := _reject_governed_write(...): return err``.
+    """
+    if is_governed_target(target):
+        return {
+            "success": False,
+            "error": (
+                f"Cannot {op_label}: {target} is on a live governed "
+                f"canonical skill surface. Canonical skills are "
+                f"discovery/promote targets, not ordinary-write targets. "
+                f"Use the explicit deploy / promotion workflow for "
+                f"canonical mutations (runtime-ops.md: source/deploy/live trinity)."
+            ),
+        }
+    return None
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -366,6 +393,11 @@ def _create_skill(
 
     # Write SKILL.md atomically
     skill_md = skill_dir / "SKILL.md"
+    # Phase 3-C.2.1: agent_create op. Reject if this path is a governed
+    # tracked target (i.e. the skill name collides with a committed canonical
+    # skill on the live profile base). Callers return the error dict.
+    if err := _reject_governed_write(skill_md, "create skill"):
+        return err
     _atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block
@@ -413,6 +445,10 @@ def _edit_skill(name: str, content: str, session_id: str = None) -> Dict[str, An
         session_id=session_id,
         created_at_default=SKILL_CREATED_AT_UNKNOWN,
     )
+    # Phase 3-C.2.1: agent_create op (edit = replace content). Reject if
+    # target is a governed tracked file.
+    if err := _reject_governed_write(skill_md, "edit skill"):
+        return err
     _atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block
@@ -509,6 +545,9 @@ def _patch_skill(
         return {"success": False, "error": err}
 
     original_content = content  # for rollback
+    # Phase 3-C.2.1: agent_create op (patch = partial replace).
+    if err := _reject_governed_write(target, "patch skill"):
+        return err
     _atomic_write_text(target, new_content)
 
     # Security scan — roll back on block
@@ -533,6 +572,10 @@ def _delete_skill(name: str) -> Dict[str, Any]:
         return {"success": False, "error": f"Skill '{name}' not found."}
 
     skill_dir = existing["path"]
+    # Phase 3-C.2.1: agent_delete op. Check SKILL.md as proxy for governance
+    # (every skill has one; is_governed_target operates on files).
+    if err := _reject_governed_write(skill_dir / "SKILL.md", "delete skill"):
+        return err
     shutil.rmtree(skill_dir)
 
     # Clean up empty category directories (don't remove SKILLS_DIR itself)
@@ -583,6 +626,10 @@ def _write_file(
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
+    # Phase 3-C.2.1: agent_create op for supporting file. Reject if the
+    # target file is a governed tracked target.
+    if err := _reject_governed_write(target, "write supporting file"):
+        return err
     _atomic_write_text(target, file_content)
 
     # Security scan — roll back on block
@@ -615,6 +662,12 @@ def _remove_file(name: str, file_path: str, session_id: str = None) -> Dict[str,
     skill_dir = existing["path"]
 
     target = skill_dir / file_path
+    # Phase 3-C.2.1: agent_delete op for supporting file. Check before the
+    # existence check so governed-rejection dominates missing-file error
+    # (caller needs to know governance, not "not found").
+    if target.exists():
+        if err := _reject_governed_write(target, "remove supporting file"):
+            return err
     if not target.exists():
         # List what's actually there for the model to see
         available = []
