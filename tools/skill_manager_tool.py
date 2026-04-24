@@ -573,7 +573,11 @@ def _delete_skill(name: str) -> Dict[str, Any]:
 
     skill_dir = existing["path"]
     # Phase 3-C.2.1: agent_delete op. Check SKILL.md as proxy for governance
-    # (every skill has one; is_governed_target operates on files).
+    # (every skill has one; is_governed_target operates on files). Known
+    # limit: if a malformed skill has tracked supporting files but no tracked
+    # SKILL.md, the rmtree below would delete them. Theoretical — skills
+    # without tracked SKILL.md are not the canonical shape. Tightening to
+    # "any tracked descendant" is a follow-up if this edge ever bites.
     if err := _reject_governed_write(skill_dir / "SKILL.md", "delete skill"):
         return err
     shutil.rmtree(skill_dir)
@@ -662,9 +666,11 @@ def _remove_file(name: str, file_path: str, session_id: str = None) -> Dict[str,
     skill_dir = existing["path"]
 
     target = skill_dir / file_path
-    # Phase 3-C.2.1: agent_delete op for supporting file. Check before the
-    # existence check so governed-rejection dominates missing-file error
-    # (caller needs to know governance, not "not found").
+    # Phase 3-C.2.1: agent_delete op for supporting file. Only gate when the
+    # target actually exists — non-existent files get the normal "not found"
+    # error so the agent sees actionable information instead of governance.
+    # (Earlier draft of this comment inverted the ordering; the code is
+    # correct.)
     if target.exists():
         if err := _reject_governed_write(target, "remove supporting file"):
             return err

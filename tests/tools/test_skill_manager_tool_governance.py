@@ -69,14 +69,18 @@ new body content goes here
 
 
 class TestGovernanceRejectsWriteOnTrackedTarget:
-    def test_create_collides_with_tracked_skill_returns_error(self, tmp_path, monkeypatch):
-        """Create flow actually fails earlier at 'already exists' (normal
-        collision check runs first). This test confirms that path returns
-        a clean error — the governance gate is belt-and-suspenders."""
+    def test_create_collides_with_tracked_skill_returns_already_exists(self, tmp_path, monkeypatch):
+        """Create on a name that already has a tracked skill hits the
+        _find_skill existing check FIRST (line 374-381), before the
+        governance gate at line 397. Test asserts the expected
+        already-exists path. The governance gate at _create_skill is
+        belt-and-suspenders — unreachable through the public API so long
+        as _find_skill runs first, but defensive for future refactors.
+        See tests below for the directly-reachable governance rejections
+        on edit/delete/write_file/remove_file."""
         home = _init_governed_home(tmp_path)
         _add_tracked_skill(home, "demo-skill", SKILL_BODY)
         monkeypatch.setenv("HERMES_HOME", str(home))
-        # Force fresh module state so SKILLS_DIR resolves against monkeypatched HERMES_HOME
         import importlib
         import tools.skill_manager_tool as mod
         importlib.reload(mod)
@@ -84,8 +88,9 @@ class TestGovernanceRejectsWriteOnTrackedTarget:
         result = mod._create_skill(name="demo-skill", content=VALID_NEW_SKILL)
 
         assert result["success"] is False
-        # Either "already exists" (normal path) OR governance message — both acceptable
-        assert "already exists" in result["error"] or "governed" in result["error"]
+        assert "already exists" in result["error"], (
+            f"expected existing-skill error first; got {result!r}"
+        )
 
     def test_edit_tracked_skill_is_rejected_as_governed(self, tmp_path, monkeypatch):
         """Editing a tracked canonical skill must return a governance error."""
