@@ -315,3 +315,40 @@ class TestPhase3A1HotfixGovernedSemantics:
         assert skill_surface.is_governed_target(skills / "seed.md") is True
         assert skill_surface.is_governed_filesystem(skills / "seed.md") is True
 
+
+class TestPhase3C23ProfileOpTokens:
+    """Phase 3-C.2.3 closes the Op taxonomy with profile_delete and
+    profile_import. Behavior-design (governance gate pattern for operator-
+    invoked commands) deferred to Phase 3-C.2.4."""
+
+    def test_profile_delete_accepted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        path = skill_surface.resolve_skill_write("any-slug", "profile_delete")
+        assert path == tmp_path / "skills" / "any-slug"
+
+    def test_profile_import_accepted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        path = skill_surface.resolve_skill_write("any-slug", "profile_import")
+        assert path == tmp_path / "skills" / "any-slug"
+
+    def test_profile_delete_not_canonical_write(self):
+        """Consistent with every other ordinary op: not "promote"."""
+        assert skill_surface.is_canonical_write_allowed("profile_delete") is False
+
+    def test_profile_import_not_canonical_write(self):
+        assert skill_surface.is_canonical_write_allowed("profile_import") is False
+
+    def test_full_op_taxonomy_has_nine_ordinary_ops(self):
+        """Document the full set so future extensions are visible to reviewers."""
+        expected = {
+            "self_learn_metadata", "agent_create", "agent_delete",
+            "hub_install", "hub_uninstall", "startup_sync",
+            "profile_seed", "profile_delete", "profile_import",
+        }
+        actual = skill_surface._ORDINARY_OPS
+        assert actual == expected, (
+            f"ORDINARY_OPS drift. Expected {expected!r}, got {actual!r}. "
+            f"If adding a new op, update both this test and the runtime-ops "
+            f"doctrine entry (decisions/... and runtime/runtime-ops.md)."
+        )
+
