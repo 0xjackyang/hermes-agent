@@ -427,8 +427,15 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         c.print(f"[bold red]Installation blocked:[/] {exc}\n")
         shutil.rmtree(q_path, ignore_errors=True)
         from tools.skills_hub import append_audit_log
+        # Phase 3-C.2.2: distinguish governance-policy rejections from
+        # scan-unsafe-path rejections in audit forensics. Governance
+        # rejections surface as "governance_violation"; other ValueError
+        # paths (unsafe quarantine, missing skill.md, etc.) keep
+        # "invalid_path".
+        _reason = str(exc)
+        _category = "governance_violation" if "governed canonical skill surface" in _reason else "invalid_path"
         append_audit_log("BLOCKED", bundle.name, bundle.source,
-                         bundle.trust_level, "invalid_path", str(exc))
+                         bundle.trust_level, _category, _reason)
         return
     from tools.skills_hub import SKILLS_DIR
     c.print(f"[bold green]Installed:[/] {install_dir.relative_to(SKILLS_DIR)}")
