@@ -51,6 +51,7 @@ __all__ = [
     "all_read_roots",
     "resolve_skill_write",
     "is_governed_target",
+    "is_governed_filesystem",
     "is_canonical_write_allowed",
     "get_live_governed_skill_surface_context",
 ]
@@ -63,16 +64,21 @@ Op = Literal[
     "discover",              # read-only scan; never writes (included for symmetry)
     "self_learn_metadata",   # lifecycle frontmatter writeback (skill_utils.py:427 today)
     "agent_create",          # agent-authored skill create/edit via skill_manager_tool
+    "agent_delete",          # agent-authored skill delete (skill_manager_tool.py:528-545)
     "hub_install",           # skills_hub install from tap/registry
+    "hub_uninstall",         # skills_hub uninstall (skills_hub.py:2581-2595)
     "startup_sync",          # skills_sync.py bundled → runtime-local copy on boot
     "profile_seed",          # profile create/setup skill seeding
     "promote",               # explicit runtime-local → canonical promotion
 ]
 
 _ORDINARY_OPS: frozenset[Op] = frozenset(
-    {"self_learn_metadata", "agent_create", "hub_install",
-     "startup_sync", "profile_seed"}
+    {"self_learn_metadata", "agent_create", "agent_delete",
+     "hub_install", "hub_uninstall", "startup_sync", "profile_seed"}
 )
+
+# Complete set for unknown-Op validation (ordinary + non-ordinary).
+_ALL_OPS: frozenset[Op] = _ORDINARY_OPS | frozenset({"discover", "promote"})
 
 
 def runtime_local_skill_root() -> Path:
@@ -119,17 +125,31 @@ def all_read_roots() -> list[Path]:
 
 
 def is_governed_target(path: Path) -> bool:
-    """True when ``path`` lands on a live governed profile skill surface.
+    """True when ``path`` is a tracked file on a live governed profile skill surface.
 
-    A "governed" surface is a HERMES_HOME that is itself a git repo whose
-    repo-root == HERMES_HOME and current branch is in
-    ``PROFILE_PROTECTED_BRANCHES``. In that state, tracked skill files
-    under ``HERMES_HOME/skills`` are canonical (discovery/promote only,
-    not ordinary-write targets).
+    Requires BOTH ``live_profile_base`` (HERMES_HOME is itself a git repo
+    with repo-root == HERMES_HOME and current branch in
+    ``PROFILE_PROTECTED_BRANCHES``) AND ``tracked`` (the specific path is
+    git-tracked). This matches the existing caller semantics in
+    ``tools/skills_sync.py`` where the governance gate is
+    ``live_profile_base AND tracked`` — dropping ``tracked`` would
+    wrongly reject new skill creation in a governed profile.
 
-    Wraps ``get_live_governed_skill_surface_context`` for a boolean answer.
-    Use the context dict directly when you need richer diagnostics
-    (branch, repo_root, reason).
+    Use ``get_live_governed_skill_surface_context`` directly when you need
+    to distinguish "governed filesystem" from "tracked path on governed
+    filesystem" or need richer diagnostics.
+    """
+    ctx = get_live_governed_skill_surface_context(path)
+    return bool(ctx.get("live_profile_base")) and bool(ctx.get("tracked"))
+
+
+def is_governed_filesystem(path: Path) -> bool:
+    """True when ``path`` is UNDER a live governed profile skill surface,
+    tracked or not.
+
+    Weaker than ``is_governed_target``. Use when the question is "am I
+    writing into the governed tree at all?" (e.g. for logging / opt-in
+    warnings) rather than "should I reject this specific write?".
     """
     ctx = get_live_governed_skill_surface_context(path)
     return bool(ctx.get("live_profile_base"))
@@ -147,15 +167,51 @@ def resolve_skill_write(slug: str, op: Op) -> Path:
     ``slug`` may contain forward-slashes for category/name layouts used
     by skills_hub (e.g. ``"gateway/bounded-interruption"``).
 
+    Slug validation rejects path traversal (``..``), absolute paths,
+    backslashes (Windows re-root), and null bytes. After validation the
+    resolved path is also verified to stay under
+    ``runtime_local_skill_root()`` — a defense-in-depth check that
+    catches symlinks / collapses that normalize outside the skill root.
+
     The resolver does NOT actively reject governed writes here — it
     returns the intended target so callers can gate on
     ``is_governed_target(path)`` before writing. Phase 3-C migrates
     consumers to use this explicitly; actively-raising semantics can be
     added once all call-sites declare their ``Op``.
     """
-    slug = slug.strip().strip("/")
-    if not slug:
-        raise ValueError("slug must be non-empty after stripping slashes")
-    if op not in _ORDINARY_OPS and op != "promote" and op != "discover":
+    if op not in _ALL_OPS:
         raise ValueError(f"unknown Op: {op!r}")
-    return runtime_local_skill_root() / slug
+
+    if not isinstance(slug, str):
+        raise TypeError(f"slug must be str, got {type(slug).__name__}")
+    if "\x00" in slug or "\\" in slug:
+        raise ValueError("slug must not contain null bytes or backslashes")
+
+    raw = slug.strip()
+    # Absolute check BEFORE trimming leading slashes — "/etc/passwd" must reject
+    # rather than be normalized into "etc/passwd".
+    if raw.startswith("/") or (len(raw) >= 2 and raw[1] == ":"):
+        # Unix absolute ("/...") or Windows drive ("C:...")
+        raise ValueError(f"slug must be relative, got absolute: {slug!r}")
+
+    trimmed = raw.strip("/")
+    if not trimmed:
+        raise ValueError("slug must be non-empty after stripping slashes")
+
+    candidate = Path(trimmed)
+    if candidate.is_absolute():
+        raise ValueError(f"slug must be relative, got absolute: {slug!r}")
+    if ".." in candidate.parts:
+        raise ValueError(f"slug must not contain parent-traversal (..): {slug!r}")
+
+    root = runtime_local_skill_root()
+    resolved = (root / candidate).resolve()
+    root_resolved = root.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        raise ValueError(
+            f"resolved slug escapes skill root: {slug!r} -> {resolved} "
+            f"(root={root_resolved})"
+        )
+    return root / candidate
