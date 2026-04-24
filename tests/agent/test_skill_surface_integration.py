@@ -125,13 +125,16 @@ class TestGovernanceInvariantIntegration:
         assert tracked.read_text() == SKILL_BODY_B, \
             "tracked file body changed; governance gate failed"
 
-        # The skipped counter must tick up for the collision. Which specific
-        # reporting bucket is used (governed_skipped vs user_modified vs just
-        # skipped) is a separate UX concern tracked as a Phase 3-D.1 follow-on.
-        # The governance invariant is the file not mutated; reporting gap is
-        # a nice-to-have that does not affect on-disk safety.
+        # Phase 3-D.1: the governance skip must surface in governed_skipped
+        # for operator audit UX, not just tick the raw skipped counter. The
+        # first-run collision branch was silently counting without reporting;
+        # Phase 3-D.1 closed that gap.
         assert result.get("skipped", 0) >= 1, (
             f"sync_skills should have skipped the collision; got {result!r}"
+        )
+        assert "demo-skill" in result.get("governed_skipped", []), (
+            f"governance skip not surfaced in governed_skipped bucket "
+            f"(Phase 3-D.1 regression); got {result!r}"
         )
 
     def test_sync_lifecycle_mark_used_does_not_mutate_tracked(self, live_governed_profile):
