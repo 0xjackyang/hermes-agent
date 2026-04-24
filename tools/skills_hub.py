@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
-from agent.skill_surface import hub_root, runtime_local_skill_root
+from agent.skill_surface import hub_root, is_governed_target, runtime_local_skill_root
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
@@ -2534,6 +2534,23 @@ def install_from_quarantine(
     else:
         install_dir = SKILLS_DIR / safe_skill_name
 
+    # Phase 3-C.2.2: hub_install governance gate. Target the canonical
+    # SKILL.md (matches skill_manager_tool delete-skill proxy pattern at
+    # skill_manager_tool.py:580-586). Raising ValueError is the existing
+    # error contract for install_from_quarantine — the CLI wrapper at
+    # hermes_cli/skills_hub.py:425-433 already converts ValueError to
+    # "Installation blocked" + BLOCKED audit entry, so no new plumbing
+    # is required. Covers both the rmtree below and the later move into
+    # install_dir (shutil.move) — same destination; one gate suffices.
+    if is_governed_target(install_dir / "SKILL.md"):
+        raise ValueError(
+            f"Cannot hub_install: {install_dir} is on a live governed "
+            f"canonical skill surface. Canonical skills are discovery/promote "
+            f"targets, not ordinary-write targets. Use the explicit deploy / "
+            f"promotion workflow for canonical mutations (runtime-ops.md: "
+            f"source/deploy/live trinity)."
+        )
+
     if install_dir.exists():
         shutil.rmtree(install_dir)
 
@@ -2587,6 +2604,17 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
         return False, f"'{skill_name}' is not a hub-installed skill (may be a builtin)"
 
     install_path = SKILLS_DIR / entry["install_path"]
+    # Phase 3-C.2.2: hub_uninstall governance gate. Returns (False, msg)
+    # matching the Tuple[bool, str] contract (see line 2587 above for the
+    # existing non-found case).
+    if is_governed_target(install_path / "SKILL.md"):
+        return False, (
+            f"Cannot hub_uninstall: {install_path} is on a live governed "
+            f"canonical skill surface. Canonical skills are "
+            f"discovery/promote targets, not ordinary-write targets. "
+            f"Use the explicit deploy / promotion workflow for canonical "
+            f"mutations."
+        )
     if install_path.exists():
         shutil.rmtree(install_path)
 
