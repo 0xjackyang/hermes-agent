@@ -377,9 +377,10 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
 def gateway_help_lines() -> list[str]:
     """Generate gateway help text lines from the registry."""
     overrides = _resolve_config_gates()
+    disabled = _resolve_disabled_gates()
     lines: list[str] = []
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, disabled):
             continue
         args = f" {cmd.args_hint}" if cmd.args_hint else ""
         alias_parts: list[str] = []
@@ -401,9 +402,10 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     canonical command.
     """
     overrides = _resolve_config_gates()
+    disabled = _resolve_disabled_gates()
     result: list[tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, disabled):
             continue
         tg_name = _sanitize_telegram_name(cmd.name)
         if tg_name:
@@ -665,9 +667,10 @@ def slack_subcommand_map() -> dict[str, str]:
     the same as /hermes background do stuff.
     """
     overrides = _resolve_config_gates()
+    disabled = _resolve_disabled_gates()
     mapping: dict[str, str] = {}
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not _is_gateway_available(cmd, overrides, disabled):
             continue
         mapping[cmd.name] = f"/{cmd.name}"
         for alias in cmd.aliases:
