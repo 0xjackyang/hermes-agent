@@ -423,11 +423,21 @@ def sync_skill_lifecycle_metadata(
     )
     persisted = False
     if changed and persist:
-        try:
-            _atomic_write_text(skill_file, new_content)
-            persisted = True
-        except Exception:
-            logger.debug("Could not persist lifecycle metadata for %s", skill_file, exc_info=True)
+        # Phase 3-C.1 governance gate: skip writeback on governed tracked files.
+        # Lazy-import to break circular dep (skill_surface already imports us).
+        from agent.skill_surface import is_governed_target as _is_governed_target
+        if _is_governed_target(skill_file):
+            logger.debug(
+                "skill lifecycle writeback deferred: governed target %s "
+                "(Phase 3-C.1 gate; see agent.skill_surface.is_governed_target)",
+                skill_file,
+            )
+        else:
+            try:
+                _atomic_write_text(skill_file, new_content)
+                persisted = True
+            except Exception:
+                logger.debug("Could not persist lifecycle metadata for %s", skill_file, exc_info=True)
     return {
         "content": new_content if changed else raw_content,
         "frontmatter": frontmatter,
