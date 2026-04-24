@@ -2783,6 +2783,16 @@ class GatewayRunner:
             return await self._handle_deny_command(event)
 
         if canonical == "update":
+            # CSO-3: enable_update_command gate. Default True preserves upstream
+            # behavior; production profiles set `gateway.enable_update_command:
+            # false` to route code changes through explicit deploy workflow.
+            if not self.config.enable_update_command:
+                return (
+                    "`/update` is disabled on this profile "
+                    "(config: `gateway.enable_update_command: false`).\n"
+                    "Code changes go through the explicit deploy workflow "
+                    "(see runtime-ops.md: source/deploy/live trinity entry)."
+                )
             return await self._handle_update_command(event)
 
         if canonical == "title":

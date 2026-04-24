@@ -47,6 +47,7 @@ class CommandDef:
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
+    gateway_disable_when_false: str | None = None  # config dotpath; when explicitly False, command is hidden from gateway surfaces
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +152,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("image", "Attach a local image file for your next prompt", "Info",
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
-               gateway_only=True),
+               gateway_only=True,
+               gateway_disable_when_false="gateway.enable_update_command"),
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",
@@ -319,7 +321,38 @@ def _resolve_config_gates() -> set[str]:
     return result
 
 
-def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
+def _resolve_disabled_gates() -> set[str]:
+    """Return canonical names of commands whose ``gateway_disable_when_false`` config
+    dotpath resolves to explicit ``False``.
+
+    Mirror of ``_resolve_config_gates`` but with inverted semantics: these commands
+    are enabled by default and only disabled when config explicitly sets the flag
+    to False (not just absent/truthy/None).
+    """
+    gated = [c for c in COMMAND_REGISTRY if c.gateway_disable_when_false]
+    if not gated:
+        return set()
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+    except Exception:
+        return set()
+    result: set[str] = set()
+    for cmd in gated:
+        val: Any = cfg
+        for key in cmd.gateway_disable_when_false.split("."):
+            if isinstance(val, dict):
+                val = val.get(key)
+            else:
+                val = None
+                break
+        if val is False:  # explicit False only; absence/None/truthy = enabled
+            result.add(cmd.name)
+    return result
+
+
+def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None,
+                          disabled: set[str] | None = None) -> bool:
     """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
 
     Unconditionally available when ``cli_only`` is False.  When ``cli_only``
@@ -327,6 +360,12 @@ def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = N
     when the config value is truthy.  Pass *config_overrides* (from
     ``_resolve_config_gates()``) to avoid re-reading config for every command.
     """
+    # Explicit disable gate short-circuits: if the command is in the disabled set,
+    # it is unavailable in gateway surfaces regardless of other rules.
+    if disabled is None:
+        disabled = _resolve_disabled_gates()
+    if cmd.name in disabled:
+        return False
     if not cmd.cli_only:
         return True
     if cmd.gateway_config_gate:

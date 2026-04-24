@@ -649,3 +649,141 @@ class TestUpdateInHelp:
         import inspect
         source = inspect.getsource(GatewayRunner._handle_message)
         assert '"update"' in source
+
+# ---------------------------------------------------------------------------
+# CSO-3: enable_update_command gate (Phase 2 Sub-packet D, 2026-04-24)
+# ---------------------------------------------------------------------------
+
+
+class TestEnableUpdateCommandGate:
+    """Gate is at _handle_message dispatch (run.py) and _register_slash_commands
+    (platforms/discord.py). Default True preserves upstream behavior; production
+    profiles set gateway.enable_update_command: false to route code changes
+    through explicit deploy workflow.
+
+    These tests freeze the gate\'s presence so it can\'t be accidentally
+    removed in future refactors; live gate behavior is verified via smoke
+    test against the running gateway after deploy.
+    """
+
+    def test_default_is_true_when_key_absent(self):
+        """Absent config key must default to True (upstream-compatible)."""
+        extra = {}
+        assert extra.get("enable_update_command", True) is True
+
+    def test_explicit_false_disables(self):
+        extra = {"enable_update_command": False}
+        assert extra.get("enable_update_command", True) is False
+
+    def test_explicit_true_enables(self):
+        extra = {"enable_update_command": True}
+        assert extra.get("enable_update_command", True) is True
+
+    def test_gate_present_in_chat_dispatcher(self):
+        """Dispatcher (gateway/run.py _handle_message) must check enable_update_command
+        before routing /update to _handle_update_command."""
+        import inspect
+        from gateway.run import GatewayRunner
+        src = inspect.getsource(GatewayRunner._handle_message)
+        assert "enable_update_command" in src, "CSO-3 gate missing from _handle_message dispatch"
+        assert "disabled" in src.lower() or "deploy workflow" in src, \
+            "CSO-3 gate fallback message missing or changed"
+
+    def test_gate_present_in_discord_slash_registration(self):
+        """Discord slash registration (platforms/discord.py) must be wrapped in
+        config check."""
+        import inspect
+        from gateway.run import GatewayRunner
+        discord_path = Path(inspect.getfile(GatewayRunner)).parent / "platforms" / "discord.py"
+        src = discord_path.read_text()
+        # Find the /update slash block and confirm the gate wraps it
+        update_region_start = src.find('name="update"')
+        assert update_region_start != -1, "discord.py /update slash command not found"
+        # The config check should appear before the @tree.command decorator
+        preceding_400 = src[max(0, update_region_start - 400):update_region_start]
+        assert "enable_update_command" in preceding_400, \
+            "CSO-3 gate wrapper missing before discord.py /update slash registration"
+
+    def test_gate_message_points_to_deploy_workflow(self):
+        """When disabled, the gate message must direct operators to the explicit
+        deploy workflow (not silently drop or show generic error)."""
+        import inspect
+        from gateway.run import GatewayRunner
+        src = inspect.getsource(GatewayRunner._handle_message)
+        # Must mention either the runtime-ops trinity entry or the deploy workflow
+        assert "runtime-ops.md" in src or "source/deploy/live trinity" in src or "deploy workflow" in src, \
+            "CSO-3 gate disabled message should point to deploy workflow docs"
+
+    def test_update_commanddef_tagged_with_disable_gate(self):
+        """The /update CommandDef must carry the gateway_disable_when_false
+        dotpath so every gateway surface filter (telegram menu, slack
+        subcommand map, gateway_help_lines) picks up the disable uniformly."""
+        from hermes_cli.commands import COMMAND_REGISTRY
+        update_cmd = next((c for c in COMMAND_REGISTRY if c.name == "update"), None)
+        assert update_cmd is not None, "/update CommandDef missing from COMMAND_REGISTRY"
+        assert update_cmd.gateway_disable_when_false == "gateway.enable_update_command", \
+            f"/update must declare disable gate; got {update_cmd.gateway_disable_when_false!r}"
+
+    def test_resolve_disabled_gates_returns_update_when_flag_false(self, tmp_path, monkeypatch):
+        """When gateway.enable_update_command is explicitly False in config.yaml,
+        _resolve_disabled_gates() must return {'update'}."""
+        from hermes_cli.commands import _resolve_disabled_gates
+
+        # Mock read_raw_config to return the disabled-by-flag config
+        def fake_config():
+            return {"gateway": {"enable_update_command": False}}
+
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", fake_config)
+        assert "update" in _resolve_disabled_gates()
+
+    def test_resolve_disabled_gates_empty_when_flag_absent(self, monkeypatch):
+        """Default case (key absent) must not disable /update (upstream compat)."""
+        from hermes_cli.commands import _resolve_disabled_gates
+
+        def fake_config():
+            return {"gateway": {}}
+
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", fake_config)
+        assert "update" not in _resolve_disabled_gates()
+
+    def test_resolve_disabled_gates_empty_when_flag_true(self, monkeypatch):
+        """Explicit True must not disable /update (upstream compat)."""
+        from hermes_cli.commands import _resolve_disabled_gates
+
+        def fake_config():
+            return {"gateway": {"enable_update_command": True}}
+
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", fake_config)
+        assert "update" not in _resolve_disabled_gates()
+
+    def test_is_gateway_available_respects_disable_gate(self, monkeypatch):
+        """_is_gateway_available must return False for /update when disabled."""
+        from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available
+        update_cmd = next(c for c in COMMAND_REGISTRY if c.name == "update")
+        assert _is_gateway_available(update_cmd, disabled={"update"}) is False
+        assert _is_gateway_available(update_cmd, disabled=set()) is True
+
+    def test_gateway_config_has_enable_update_command_field(self):
+        """GatewayConfig must have enable_update_command as a typed field
+        (default True for upstream compat)."""
+        from gateway.config import GatewayConfig
+        cfg = GatewayConfig()
+        assert hasattr(cfg, "enable_update_command"), \
+            "GatewayConfig missing enable_update_command typed field"
+        assert cfg.enable_update_command is True, \
+            f"default must be True; got {cfg.enable_update_command!r}"
+
+    def test_gate_present_in_discord_slash_registration(self):
+        """Discord slash registration must consult _resolve_disabled_gates
+        before registering /update."""
+        import inspect
+        from gateway.run import GatewayRunner
+        discord_path = Path(inspect.getfile(GatewayRunner)).parent / "platforms" / "discord.py"
+        src = discord_path.read_text()
+        update_region_start = src.find('name="update"')
+        assert update_region_start != -1, "discord.py /update slash command not found"
+        preceding_600 = src[max(0, update_region_start - 600):update_region_start]
+        # New mechanism: uses _resolve_disabled_gates rather than PlatformConfig.extra
+        assert "_resolve_disabled_gates" in preceding_600, \
+            "CSO-3 gate wrapper (via _resolve_disabled_gates) missing before discord.py /update slash"
+

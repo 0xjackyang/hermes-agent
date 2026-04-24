@@ -249,6 +249,10 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
 
+    # CSO-3 (Phase 2 Sub-packet D, 2026-04-24): disable /update slash + chat
+    # dispatch on production profiles. Default True preserves upstream behavior.
+    enable_update_command: bool = True
+
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
@@ -477,6 +481,9 @@ def load_gateway_config() -> GatewayConfig:
 
             if "thread_sessions_per_user" in yaml_cfg:
                 gw_data["thread_sessions_per_user"] = yaml_cfg["thread_sessions_per_user"]
+
+            if "enable_update_command" in yaml_cfg:
+                gw_data["enable_update_command"] = yaml_cfg["enable_update_command"]
 
             streaming_cfg = yaml_cfg.get("streaming")
             if isinstance(streaming_cfg, dict):
