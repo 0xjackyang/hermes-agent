@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
+from agent.skill_surface import hub_root, runtime_local_skill_root
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
@@ -44,8 +45,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 HERMES_HOME = get_hermes_home()
-SKILLS_DIR = HERMES_HOME / "skills"
-HUB_DIR = SKILLS_DIR / ".hub"
+SKILLS_DIR = runtime_local_skill_root()  # Phase 3-B: resolver-backed
+HUB_DIR = hub_root()  # Phase 3-B: resolver-backed
 LOCK_FILE = HUB_DIR / "lock.json"
 QUARANTINE_DIR = HUB_DIR / "quarantine"
 AUDIT_LOG = HUB_DIR / "audit.log"

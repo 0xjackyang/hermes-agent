@@ -30,6 +30,7 @@ import os
 import shutil
 from pathlib import Path
 from hermes_constants import get_hermes_home
+from agent.skill_surface import runtime_local_skill_root
 from typing import Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION = "protected_custom_collision"
 
 
 HERMES_HOME = get_hermes_home()
-SKILLS_DIR = HERMES_HOME / "skills"
+SKILLS_DIR = runtime_local_skill_root()  # Phase 3-B: resolver-backed
 MANIFEST_FILE = SKILLS_DIR / ".bundled_manifest"
 
 
