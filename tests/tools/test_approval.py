@@ -722,3 +722,68 @@ class TestDetectDangerousPhase2CSO1:
             is_dangerous, key, desc = detect_dangerous_command(cmd)
             assert is_dangerous is False, f"legitimate command flagged: {cmd!r} desc={desc!r}"
 
+
+class TestDetectDangerousPhase2CSO1Scope2B1:
+    """Phase 2 Sub-packet C Scope 2B.1: ln + tee coverage into protected trees.
+
+    Parallels Scope 2B which covered `>`/cp/mv/sed. Scope 2B.1 closes the
+    `tee`-redirect and `ln -sf` symlink-steer paths for the same two
+    protected trees (hermes deploy tree + systemd user unit files).
+    """
+
+    def test_tee_into_hermes_deploy_detected(self):
+        for cmd in [
+            "echo foo | tee ~/.hermes-deploy/hermes-agent/tools/approval.py",
+            "cat bad.py | tee $HOME/.hermes-deploy/hermes-agent/gateway/run.py",
+            "tee ~/.hermes-deploy/x < input",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"should flag: {cmd}"
+            assert "deploy" in desc.lower(), f"desc should mention deploy: {desc!r}"
+
+    def test_tee_into_systemd_user_unit_detected(self):
+        for cmd in [
+            "echo '[Service]' | tee ~/.config/systemd/user/hermes-gateway.service",
+            "cat bad.service | tee $HOME/.config/systemd/user/hermes-gateway-satori-hermes.service",
+            "tee ~/.config/systemd/user/foo.service < rogue",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"should flag: {cmd}"
+            lower = desc.lower()
+            assert "systemd" in lower or "unit" in lower, f"desc should mention systemd/unit: {desc!r}"
+
+    def test_ln_into_hermes_deploy_detected(self):
+        for cmd in [
+            "ln -s /tmp/malicious ~/.hermes-deploy/hermes-agent/tools/approval.py",
+            "ln -sf /tmp/other $HOME/.hermes-deploy/hermes-agent/gateway/run.py",
+            "ln -f /tmp/hard ~/.hermes-deploy/config.yaml",
+            "ln /tmp/plain ~/.hermes-deploy/target",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"should flag: {cmd}"
+            assert "deploy" in desc.lower(), f"desc should mention deploy: {desc!r}"
+
+    def test_ln_into_systemd_user_unit_detected(self):
+        for cmd in [
+            "ln -s /tmp/rogue.service ~/.config/systemd/user/hermes-gateway.service",
+            "ln -sf /tmp/bad $HOME/.config/systemd/user/hermes-gateway-satori-hermes.service",
+            "ln /tmp/hard ~/.config/systemd/user/foo.service",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"should flag: {cmd}"
+            lower = desc.lower()
+            assert "systemd" in lower or "unit" in lower, f"desc should mention systemd/unit: {desc!r}"
+
+    def test_legitimate_ln_tee_still_pass(self):
+        # Negative: legitimate ln/tee outside protected trees must not trigger.
+        for cmd in [
+            "echo test | tee ~/scratch/log.txt",                   # not protected tree
+            "tee /tmp/output.txt",                                  # just /tmp
+            "ln -s /usr/bin/python ~/bin/python3",                  # user bin, not protected
+            "ln -sf /tmp/cache ~/work/cache",                       # not protected tree
+            "cat ~/.hermes-deploy/README.md",                       # read-only, not write
+            "ls ~/.config/systemd/user/",                           # read-only, not write
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is False, f"legitimate command flagged: {cmd!r} desc={desc!r}"
+

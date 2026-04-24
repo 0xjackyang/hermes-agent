@@ -120,6 +120,18 @@ DANGEROUS_PATTERNS = [
     # Git history rewrites on remote tracking branches
     (r'\bgit\s+push\s+(?:[^\n]*\s)?(?:-f|--force)(?:\s|$)', "git force-push (history rewrite)"),
     (r'\bgit\s+reset\s+--hard\s+origin/', "git reset --hard to remote (discards local history)"),
+    # ---- Phase 2 Sub-packet C Scope 2B.1 additions (2026-04-24) ----
+    # tee into protected trees -- parallels the existing `>`/cp/mv/sed coverage
+    # above. The existing generic `tee` rule targets _SENSITIVE_WRITE_TARGET
+    # (/etc, /dev/sd, SSH, hermes .env) but NOT the Phase-2-specific trees.
+    (r'\btee\b[^\n]*\s(?:~|\$home|\$\{home\})/\.hermes-deploy/', "tee into hermes deploy tree (use deploy workflow instead)"),
+    (r'\btee\b[^\n]*\s(?:~|\$home|\$\{home\})/\.config/systemd/user/[^/\s]*\.service\b', "tee into systemd user unit file"),
+    # ln -s / ln -f into protected trees -- symlink-steer + hardlink-overwrite
+    # operator-accident class. -s alone is overwrite-safe by default, but -f
+    # (and -sf combinations) silently replace existing files with links.
+    # Match any ln invocation targeting the protected paths to cover both.
+    (r'\bln\b[^\n]*\s(?:~|\$home|\$\{home\})/\.hermes-deploy/', "ln into hermes deploy tree (use deploy workflow instead)"),
+    (r'\bln\b[^\n]*\s(?:~|\$home|\$\{home\})/\.config/systemd/user/[^/\s]*\.service\b', "ln into systemd user unit file"),
 ]
 
 
