@@ -262,10 +262,18 @@ def sync_skills(quiet: bool = False) -> dict:
                     # syncs do not later overwrite the tracked custom skill.
                     skipped += 1
                     if _is_live_governed_tracked_skill_surface(dest):
+                        # Phase 3-D.1: surface the governance skip in the
+                        # result dict alongside the update paths (lines 320,
+                        # 332). Previously this branch silently ticked only
+                        # the `skipped` counter, leaving operator audit UX
+                        # blind to why a tracked custom skill was preserved.
+                        governed_skipped.append(skill_name)
                         manifest[skill_name] = _format_manifest_entry(
                             _dir_hash(dest),
                             flags={MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION},
                         )
+                        if not quiet:
+                            print(f"  = {skill_name} (live governed tracked surface, preserving custom skill)")
                     else:
                         manifest[skill_name] = _format_manifest_entry(bundled_hash)
                 else:

@@ -556,8 +556,13 @@ class TestSyncSkills:
             manifest_after_second_sync = _read_manifest()
             second_origin_hash, second_flags = _parse_manifest_entry(manifest_after_second_sync["old-skill"])
 
+        # Phase 3-D.1: first-run collision on live base now surfaces the
+        # governance skip in governed_skipped (was silently just ticking the
+        # skipped counter). Second sync runs after `checkout -b packet/worktree`
+        # so it's off live-base — the preserve-off-live-base path does not
+        # append to governed_skipped (unchanged, correct).
         assert first_result["updated"] == []
-        assert first_result["governed_skipped"] == []
+        assert first_result["governed_skipped"] == ["old-skill"]
         assert first_origin_hash == _dir_hash(tracked_skill)
         assert first_flags == {MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION}
         assert second_result["updated"] == []
@@ -593,8 +598,11 @@ class TestSyncSkills:
             manifest_after_third_sync = _read_manifest()
             third_origin_hash, third_flags = _parse_manifest_entry(manifest_after_third_sync["old-skill"])
 
+        # Phase 3-D.1: first-run collision on live base surfaces governance skip.
+        # Second sync is still on live base but bundled_hash == origin_hash
+        # (no rewrite needed) so the in-sync branch does not touch governed_skipped.
         assert first_result["updated"] == []
-        assert first_result["governed_skipped"] == []
+        assert first_result["governed_skipped"] == ["old-skill"]
         assert first_origin_hash == _dir_hash(tracked_skill)
         assert first_flags == {MANIFEST_FLAG_PROTECTED_CUSTOM_COLLISION}
 
