@@ -68,13 +68,16 @@ Op = Literal[
     "hub_install",           # skills_hub install from tap/registry
     "hub_uninstall",         # skills_hub uninstall (skills_hub.py:2581-2595)
     "startup_sync",          # skills_sync.py bundled → runtime-local copy on boot
-    "profile_seed",          # profile create/setup skill seeding
+    "profile_seed",          # profile create/setup skill seeding (profiles.py)
+    "profile_delete",        # full-profile rmtree (profiles.py::delete_profile)
+    "profile_import",        # archive-restore to profile_dir (profiles.py::import_profile)
     "promote",               # explicit runtime-local → canonical promotion
 ]
 
 _ORDINARY_OPS: frozenset[Op] = frozenset(
     {"self_learn_metadata", "agent_create", "agent_delete",
-     "hub_install", "hub_uninstall", "startup_sync", "profile_seed"}
+     "hub_install", "hub_uninstall", "startup_sync", "profile_seed",
+     "profile_delete", "profile_import"}
 )
 
 # Complete set for unknown-Op validation (ordinary + non-ordinary).
