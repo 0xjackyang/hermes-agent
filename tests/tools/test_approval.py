@@ -646,3 +646,79 @@ class TestNormalizationBypass:
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is False
 
+class TestDetectDangerousPhase2CSO1:
+    """Phase 2 Sub-packet C Scope 2B: CSO-1 pattern expansion (2026-04-24).
+
+    Patterns defend Sub-packet A source/deploy separation and related
+    operator-discipline surfaces from accidental shell-driven bypass.
+    """
+
+    def test_pip_install_editable_detected(self):
+        for cmd in [
+            "pip install -e ~/src/hermes-agent-openkb",
+            "pip3 install -e /home/jackyujieyang/src/hermes-agent-openkb",
+            "pip install --editable ~/src/hermes-agent-openkb",
+            "pip install -e .",
+            "~/.local/share/hermes-agent-venv/bin/pip install -e ~/.hermes-deploy/hermes-agent/",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"should flag: {cmd}"
+            assert "editable" in desc.lower(), f"desc should mention editable: {desc!r}"
+
+    def test_hermes_deploy_shell_write_detected(self):
+        for cmd in [
+            "echo foo > ~/.hermes-deploy/hermes-agent/somefile",
+            "cat /etc/passwd > $HOME/.hermes-deploy/x",
+            "cp malicious.py ~/.hermes-deploy/hermes-agent/tools/",
+            "mv secret ~/.hermes-deploy/",
+            "sed -i 's/foo/bar/g' ~/.hermes-deploy/hermes-agent/some.py",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"should flag: {cmd}"
+            assert "deploy" in desc.lower(), f"desc should mention deploy: {desc!r}"
+
+    def test_systemd_unit_shell_write_detected(self):
+        for cmd in [
+            "echo '[Service]' > ~/.config/systemd/user/hermes-gateway.service",
+            "cat bad.service >> ~/.config/systemd/user/hermes-gateway-satori-hermes.service",
+            "sed -i 's/90/180/' ~/.config/systemd/user/hermes-gateway-satori-hermes.service",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"should flag: {cmd}"
+            lower = desc.lower()
+            assert "systemd" in lower or "unit" in lower, f"desc should mention systemd/unit: {desc!r}"
+
+    def test_git_force_push_and_hard_reset_detected(self):
+        for cmd in [
+            "git push --force origin main",
+            "git push -f origin main",
+            "git reset --hard origin/main",
+            "git reset --hard origin/local/macbook-home",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is True, f"should flag: {cmd}"
+
+    def test_git_force_with_lease_NOT_caught(self):
+        # --force-with-lease is the safer variant; intentionally NOT caught
+        # (we use it ourselves, e.g., in PR rebase workflows).
+        for cmd in [
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease origin feature-branch",
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is False, f"--force-with-lease should NOT trigger approval: {cmd}"
+
+    def test_legitimate_commands_still_pass(self):
+        # Negative cases: common legitimate operations that share substrings
+        # with the new patterns should NOT trigger.
+        for cmd in [
+            "pip install requests",                            # not editable
+            "pip install --upgrade pytest",                    # not editable
+            "echo test > ~/scratch/log.txt",                   # not .hermes-deploy or systemd
+            "cat ~/.config/systemd/user/foo.service",          # read-only, not write
+            "git push origin main",                            # no --force
+            "git reset HEAD~1",                                 # not --hard origin/
+        ]:
+            is_dangerous, key, desc = detect_dangerous_command(cmd)
+            assert is_dangerous is False, f"legitimate command flagged: {cmd!r} desc={desc!r}"
+

@@ -105,6 +105,21 @@ DANGEROUS_PATTERNS = [
     (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
     (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
     (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
+    # ---- Phase 2 Sub-packet C Scope 2B additions (2026-04-24) ----
+    # Rewire hermes editable install — defeats Sub-packet A source/deploy
+    # separation. Catches `pip install -e <path>` broadly; legitimate deploy
+    # invocations pass through approval (low-frequency).
+    (r'\bpip(?:3)?\s+install\s+(?:[^\n]*\s)?(?:-e|--editable)\b', "editable-install rewrite (affects hermes import path)"),
+    # Shell writes to ~/.hermes-deploy/ bypass the documented deploy workflow
+    (r'(?:>|>>)\s*(?:~|\$home|\$\{home\})/\.hermes-deploy/', "shell write to hermes deploy tree (use deploy workflow instead)"),
+    (r'\b(?:cp|mv|install)\b[^\n]*\s(?:~|\$home|\$\{home\})/\.hermes-deploy/', "cp/mv/install into hermes deploy tree"),
+    (r'\bsed\s+(?:[^\n]*\s)?-[^\s]*i[^\s]*\b[^\n]*\s(?:~|\$home|\$\{home\})/\.hermes-deploy/', "in-place edit in hermes deploy tree"),
+    # Shell writes to systemd user unit files bypass backup-before-edit discipline
+    (r'(?:>|>>)\s*(?:~|\$home|\$\{home\})/\.config/systemd/user/[^/\s]*\.service\b', "shell overwrite of systemd user unit file"),
+    (r'\bsed\s+(?:[^\n]*\s)?-[^\s]*i[^\s]*\b[^\n]*\s(?:~|\$home|\$\{home\})/\.config/systemd/user/[^/\s]*\.service\b', "in-place edit of systemd user unit file"),
+    # Git history rewrites on remote tracking branches
+    (r'\bgit\s+push\s+(?:[^\n]*\s)?(?:-f|--force)(?:\s|$)', "git force-push (history rewrite)"),
+    (r'\bgit\s+reset\s+--hard\s+origin/', "git reset --hard to remote (discards local history)"),
 ]
 
 
