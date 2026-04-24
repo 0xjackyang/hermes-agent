@@ -4080,8 +4080,9 @@ def cmd_profile(args):
     elif action == "delete":
         name = args.profile_name
         yes = getattr(args, "yes", False)
+        force = getattr(args, "force", False)
         try:
-            delete_profile(name, yes=yes)
+            delete_profile(name, yes=yes, force=force)
         except (ValueError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -4165,7 +4166,11 @@ def cmd_profile(args):
     elif action == "import":
         from hermes_cli.profiles import import_profile
         try:
-            profile_dir = import_profile(args.archive, name=getattr(args, "import_name", None))
+            profile_dir = import_profile(
+                args.archive,
+                name=getattr(args, "import_name", None),
+                force=getattr(args, "force", False),
+            )
             name = profile_dir.name
             print(f"✓ Imported profile '{name}' at {profile_dir}")
 
@@ -5566,6 +5571,9 @@ For more help on a command:
     profile_delete.add_argument("profile_name", help="Profile to delete")
     profile_delete.add_argument("-y", "--yes", action="store_true",
                                 help="Skip confirmation prompt")
+    profile_delete.add_argument("--force", action="store_true",
+                                help="Override governance gate on live governed profiles "
+                                     "(see Phase 3-C.2.4 doctrine in 0xsatorisan decisions)")
 
     profile_show = profile_subparsers.add_parser("show", help="Show profile details")
     profile_show.add_argument("profile_name", help="Profile to show")
@@ -5590,6 +5598,9 @@ For more help on a command:
     profile_import.add_argument("archive", help="Path to .tar.gz archive")
     profile_import.add_argument("--name", dest="import_name", metavar="NAME",
                                 help="Profile name (default: inferred from archive)")
+    profile_import.add_argument("--force", action="store_true",
+                                help="Override governance gate on live governed profiles "
+                                     "(see Phase 3-C.2.4 doctrine in 0xsatorisan decisions)")
 
     profile_parser.set_defaults(func=cmd_profile)
 
