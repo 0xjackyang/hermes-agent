@@ -70,6 +70,7 @@ import json
 import logging
 
 from hermes_constants import get_hermes_home
+from agent.skill_surface import runtime_local_skill_root
 import os
 import re
 from enum import Enum
@@ -85,7 +86,7 @@ logger = logging.getLogger(__name__)
 # This is the single source of truth -- agent edits, hub installs, and bundled
 # skills all coexist here without polluting the git repo.
 HERMES_HOME = get_hermes_home()
-SKILLS_DIR = HERMES_HOME / "skills"
+SKILLS_DIR = runtime_local_skill_root()  # Phase 3-B: resolver-backed
 
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64

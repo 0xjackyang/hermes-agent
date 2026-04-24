@@ -40,6 +40,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from hermes_constants import get_hermes_home
+from agent.skill_surface import runtime_local_skill_root
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,7 @@ from agent.skill_utils import (
 
 # All skills live in ~/.hermes/skills/ (single source of truth)
 HERMES_HOME = get_hermes_home()
-SKILLS_DIR = HERMES_HOME / "skills"
+SKILLS_DIR = runtime_local_skill_root()  # Phase 3-B: resolver-backed
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
