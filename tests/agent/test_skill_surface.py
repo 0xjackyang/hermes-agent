@@ -78,16 +78,25 @@ class TestResolveSkillWrite:
             p = skill_surface.resolve_skill_write("foo", op)  # type: ignore[arg-type]
             assert p == tmp_path / "skills" / "foo", f"op={op} path={p}"
 
-    def test_slug_with_leading_or_trailing_slash_stripped(self, tmp_path, monkeypatch):
+    def test_trailing_slash_stripped(self, tmp_path, monkeypatch):
+        """Trailing slash is safe to normalize — it means "this dir"."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        assert skill_surface.resolve_skill_write("/foo/", "agent_create") == \
+        assert skill_surface.resolve_skill_write("foo/", "agent_create") == \
             tmp_path / "skills" / "foo"
+
+    def test_leading_slash_rejected_as_absolute(self, tmp_path, monkeypatch):
+        """Leading slash is ambiguous with absolute paths (/etc/passwd);
+        reject rather than silently normalize to avoid the traversal class."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with pytest.raises(ValueError, match="absolute"):
+            skill_surface.resolve_skill_write("/foo/", "agent_create")
 
     def test_empty_slug_raises(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         with pytest.raises(ValueError, match="non-empty"):
             skill_surface.resolve_skill_write("", "agent_create")
-        with pytest.raises(ValueError, match="non-empty"):
+        # "/" is now caught by the absolute-path check before emptiness
+        with pytest.raises(ValueError, match="absolute|non-empty"):
             skill_surface.resolve_skill_write("/", "agent_create")
 
     def test_unknown_op_raises(self, tmp_path, monkeypatch):
@@ -182,3 +191,127 @@ class TestDeprecationShim:
     def test_skill_utils_still_exports_live_governed_context(self):
         from agent.skill_utils import get_live_governed_skill_surface_context as legacy
         assert legacy is skill_surface.get_live_governed_skill_surface_context
+
+
+class TestPhase3A1HotfixPathTraversal:
+    """Phase 3-A.1 hotfix: slug validation rejects traversal/absolute/backslash."""
+
+    def test_parent_traversal_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with pytest.raises(ValueError, match="parent-traversal|escapes skill root"):
+            skill_surface.resolve_skill_write("../escape", "agent_create")
+
+    def test_embedded_parent_traversal_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with pytest.raises(ValueError, match="parent-traversal|escapes skill root"):
+            skill_surface.resolve_skill_write("a/../escape", "agent_create")
+
+    def test_absolute_unix_path_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with pytest.raises(ValueError, match="absolute|escapes"):
+            skill_surface.resolve_skill_write("/etc/passwd", "agent_create")
+
+    def test_backslash_rejected(self, tmp_path, monkeypatch):
+        """Backslashes can re-root on Windows (C:\\..., UNC \\\\server\\...).
+        Reject at validation rather than rely on Path join semantics."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with pytest.raises(ValueError, match="backslash|null byte"):
+            skill_surface.resolve_skill_write("cat\\name", "agent_create")
+
+    def test_null_byte_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with pytest.raises(ValueError, match="null byte|backslash"):
+            skill_surface.resolve_skill_write("cat\x00name", "agent_create")
+
+    def test_resolved_path_inside_root(self, tmp_path, monkeypatch):
+        """Defense-in-depth: resolve to canonical path + verify still under root."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        out = skill_surface.resolve_skill_write("cat/name", "agent_create")
+        root = tmp_path / "skills"
+        assert out.resolve().is_relative_to(root.resolve()), \
+            f"resolved path {out.resolve()} escaped root {root.resolve()}"
+
+
+class TestPhase3A1HotfixOpTaxonomy:
+    """Phase 3-A.1 hotfix: delete/uninstall tokens added."""
+
+    def test_agent_delete_accepted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert skill_surface.resolve_skill_write("cat/name", "agent_delete") == \
+            tmp_path / "skills" / "cat" / "name"
+
+    def test_hub_uninstall_accepted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert skill_surface.resolve_skill_write("cat/name", "hub_uninstall") == \
+            tmp_path / "skills" / "cat" / "name"
+
+    def test_agent_delete_not_canonical_write(self):
+        assert skill_surface.is_canonical_write_allowed("agent_delete") is False
+
+    def test_hub_uninstall_not_canonical_write(self):
+        assert skill_surface.is_canonical_write_allowed("hub_uninstall") is False
+
+
+class TestPhase3A1HotfixGovernedSemantics:
+    """Phase 3-A.1 hotfix: is_governed_target requires tracked; is_governed_filesystem split out."""
+
+    def test_untracked_on_live_profile_base_is_not_governed_target(self, tmp_path, monkeypatch):
+        """NEW path under live governed profile base → not tracked → NOT governed target.
+        Codex finding: without this, Phase 3-C callers would wrongly reject new skill creation."""
+        import subprocess
+        home = tmp_path / "profiles" / "test"
+        home.mkdir(parents=True)
+        skills = home / "skills"
+        skills.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(home)], check=True)
+        subprocess.run(["git", "-C", str(home), "config", "user.email", "t@t.t"], check=True)
+        subprocess.run(["git", "-C", str(home), "config", "user.name", "t"], check=True)
+        # Seed a tracked file so branch is committed
+        (skills / "seed.md").write_text("seed")
+        subprocess.run(["git", "-C", str(home), "add", "skills/seed.md"], check=True)
+        subprocess.run(["git", "-C", str(home), "commit", "-q", "-m", "seed"], check=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        # NEW untracked file — must NOT be flagged as governed-target
+        new_path = skills / "new-skill.md"
+        assert skill_surface.is_governed_target(new_path) is False, \
+            "untracked new file on governed profile must not be rejected by is_governed_target"
+
+    def test_untracked_on_live_profile_base_IS_governed_filesystem(self, tmp_path, monkeypatch):
+        """Same scenario: is_governed_filesystem returns True (the FS is governed),
+        is_governed_target returns False (the specific path is not tracked)."""
+        import subprocess
+        home = tmp_path / "profiles" / "test"
+        home.mkdir(parents=True)
+        skills = home / "skills"
+        skills.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(home)], check=True)
+        subprocess.run(["git", "-C", str(home), "config", "user.email", "t@t.t"], check=True)
+        subprocess.run(["git", "-C", str(home), "config", "user.name", "t"], check=True)
+        (skills / "seed.md").write_text("seed")
+        subprocess.run(["git", "-C", str(home), "add", "skills/seed.md"], check=True)
+        subprocess.run(["git", "-C", str(home), "commit", "-q", "-m", "seed"], check=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        new_path = skills / "new-skill.md"
+        assert skill_surface.is_governed_filesystem(new_path) is True
+        assert skill_surface.is_governed_target(new_path) is False
+
+    def test_tracked_on_live_profile_base_IS_governed_target(self, tmp_path, monkeypatch):
+        """Original test still holds: tracked file on main → governed_target True."""
+        import subprocess
+        home = tmp_path / "profiles" / "test"
+        home.mkdir(parents=True)
+        skills = home / "skills"
+        skills.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(home)], check=True)
+        subprocess.run(["git", "-C", str(home), "config", "user.email", "t@t.t"], check=True)
+        subprocess.run(["git", "-C", str(home), "config", "user.name", "t"], check=True)
+        (skills / "seed.md").write_text("seed")
+        subprocess.run(["git", "-C", str(home), "add", "skills/seed.md"], check=True)
+        subprocess.run(["git", "-C", str(home), "commit", "-q", "-m", "seed"], check=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        assert skill_surface.is_governed_target(skills / "seed.md") is True
+        assert skill_surface.is_governed_filesystem(skills / "seed.md") is True
+
