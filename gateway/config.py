@@ -343,6 +343,7 @@ class GatewayConfig:
             "stt_enabled": self.stt_enabled,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
+            "enable_update_command": self.enable_update_command,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
         }
@@ -404,6 +405,7 @@ class GatewayConfig:
             stt_enabled=_coerce_bool(stt_enabled, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
+            enable_update_command=_coerce_bool(data.get("enable_update_command"), True),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
         )
@@ -482,8 +484,11 @@ def load_gateway_config() -> GatewayConfig:
             if "thread_sessions_per_user" in yaml_cfg:
                 gw_data["thread_sessions_per_user"] = yaml_cfg["thread_sessions_per_user"]
 
-            if "enable_update_command" in yaml_cfg:
-                gw_data["enable_update_command"] = yaml_cfg["enable_update_command"]
+            # CSO-3 (Phase 2 Sub-packet D): read nested gateway.enable_update_command
+            # (matches _resolve_disabled_gates dotpath and fallback message convention).
+            gw_yaml_cfg = yaml_cfg.get("gateway")
+            if isinstance(gw_yaml_cfg, dict) and "enable_update_command" in gw_yaml_cfg:
+                gw_data["enable_update_command"] = gw_yaml_cfg["enable_update_command"]
 
             streaming_cfg = yaml_cfg.get("streaming")
             if isinstance(streaming_cfg, dict):

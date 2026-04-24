@@ -666,19 +666,6 @@ class TestEnableUpdateCommandGate:
     test against the running gateway after deploy.
     """
 
-    def test_default_is_true_when_key_absent(self):
-        """Absent config key must default to True (upstream-compatible)."""
-        extra = {}
-        assert extra.get("enable_update_command", True) is True
-
-    def test_explicit_false_disables(self):
-        extra = {"enable_update_command": False}
-        assert extra.get("enable_update_command", True) is False
-
-    def test_explicit_true_enables(self):
-        extra = {"enable_update_command": True}
-        assert extra.get("enable_update_command", True) is True
-
     def test_gate_present_in_chat_dispatcher(self):
         """Dispatcher (gateway/run.py _handle_message) must check enable_update_command
         before routing /update to _handle_update_command."""
@@ -688,21 +675,6 @@ class TestEnableUpdateCommandGate:
         assert "enable_update_command" in src, "CSO-3 gate missing from _handle_message dispatch"
         assert "disabled" in src.lower() or "deploy workflow" in src, \
             "CSO-3 gate fallback message missing or changed"
-
-    def test_gate_present_in_discord_slash_registration(self):
-        """Discord slash registration (platforms/discord.py) must be wrapped in
-        config check."""
-        import inspect
-        from gateway.run import GatewayRunner
-        discord_path = Path(inspect.getfile(GatewayRunner)).parent / "platforms" / "discord.py"
-        src = discord_path.read_text()
-        # Find the /update slash block and confirm the gate wraps it
-        update_region_start = src.find('name="update"')
-        assert update_region_start != -1, "discord.py /update slash command not found"
-        # The config check should appear before the @tree.command decorator
-        preceding_400 = src[max(0, update_region_start - 400):update_region_start]
-        assert "enable_update_command" in preceding_400, \
-            "CSO-3 gate wrapper missing before discord.py /update slash registration"
 
     def test_gate_message_points_to_deploy_workflow(self):
         """When disabled, the gate message must direct operators to the explicit
@@ -787,3 +759,60 @@ class TestEnableUpdateCommandGate:
         assert "_resolve_disabled_gates" in preceding_600, \
             "CSO-3 gate wrapper (via _resolve_disabled_gates) missing before discord.py /update slash"
 
+
+    def test_load_gateway_config_reads_nested_gateway_enable_update_command(self, tmp_path, monkeypatch):
+        """End-to-end: writing `gateway.enable_update_command: false` to a config.yaml
+        and calling load_gateway_config() must produce a GatewayConfig with
+        enable_update_command=False. This catches loader/dotpath schema drift
+        (round 3 regression: top-level vs nested key).
+        """
+        import importlib
+        import yaml as _yaml
+
+        fake_home = tmp_path / ".hermes" / "profiles" / "test-profile"
+        fake_home.mkdir(parents=True)
+        config_yaml = fake_home / "config.yaml"
+        config_yaml.write_text(_yaml.safe_dump({
+            "gateway": {
+                "enable_update_command": False,
+            },
+        }))
+
+        # Redirect loader to our fake profile dir
+        from gateway import config as gateway_config
+        monkeypatch.setattr(gateway_config, "get_hermes_home", lambda: fake_home, raising=False)
+        # Fall-back: many loaders compute home at call-time via env
+        monkeypatch.setenv("HERMES_PROFILE_DIR", str(fake_home))
+
+        cfg = gateway_config.load_gateway_config()
+        assert cfg.enable_update_command is False, \
+            f"loader failed to read nested gateway.enable_update_command; got {cfg.enable_update_command!r}"
+
+    def test_load_gateway_config_default_is_true_when_key_absent(self, tmp_path, monkeypatch):
+        """No gateway.enable_update_command key → default True (upstream compat)."""
+        import yaml as _yaml
+
+        fake_home = tmp_path / ".hermes" / "profiles" / "test-profile"
+        fake_home.mkdir(parents=True)
+        config_yaml = fake_home / "config.yaml"
+        config_yaml.write_text(_yaml.safe_dump({"gateway": {}}))
+
+        from gateway import config as gateway_config
+        monkeypatch.setattr(gateway_config, "get_hermes_home", lambda: fake_home, raising=False)
+        monkeypatch.setenv("HERMES_PROFILE_DIR", str(fake_home))
+
+        cfg = gateway_config.load_gateway_config()
+        assert cfg.enable_update_command is True
+
+    def test_gateway_config_to_dict_round_trip_preserves_flag(self):
+        """to_dict() must include enable_update_command so round-tripping
+        (e.g. serialization for debugging, hermes dump) does not lose the flag."""
+        from gateway.config import GatewayConfig
+        cfg = GatewayConfig(enable_update_command=False)
+        d = cfg.to_dict()
+        assert "enable_update_command" in d
+        assert d["enable_update_command"] is False
+
+        # from_dict reciprocal:
+        rehydrated = GatewayConfig.from_dict(d)
+        assert rehydrated.enable_update_command is False
