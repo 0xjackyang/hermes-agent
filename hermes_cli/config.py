@@ -656,6 +656,7 @@ DEFAULT_CONFIG = {
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
+        "enable_update_action": True,  # Allow the dashboard to trigger `hermes update`
     },
 
     # Privacy settings
