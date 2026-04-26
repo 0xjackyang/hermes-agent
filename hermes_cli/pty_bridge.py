@@ -108,9 +108,15 @@ class PtyBridge:
                     "(or pip install -e '.[pty]')."
                 )
             raise PtyUnavailableError("Pseudo-terminals are unavailable.")
-        # Let caller-supplied env fully override inheritance; if they pass
-        # None we inherit the server's env (same semantics as subprocess).
-        spawn_env = os.environ.copy() if env is None else env
+        # Let caller-supplied env override inheritance; ensure TERM exists so
+        # terminal-aware children (tput, curses, shells) can query PTY state in
+        # minimal service/CI environments.
+        spawn_env = os.environ.copy() if env is None else dict(env)
+        spawn_env.setdefault("TERM", "xterm-256color")
+        # COLUMNS/LINES can be stale in CI/service parents and override the
+        # PTY ioctl for tools like tput. The PTY winsize is the source of truth.
+        spawn_env.pop("COLUMNS", None)
+        spawn_env.pop("LINES", None)
         proc = ptyprocess.PtyProcess.spawn(  # type: ignore[union-attr]
             list(argv),
             cwd=cwd,
@@ -184,8 +190,16 @@ class PtyBridge:
         """Forward a terminal resize to the child via ``TIOCSWINSZ``."""
         if self._closed:
             return
+        rows = max(1, rows)
+        cols = max(1, cols)
+        try:
+            self._proc.setwinsize(rows, cols)
+            return
+        except (AttributeError, OSError):
+            pass
+
         # struct winsize: rows, cols, xpixel, ypixel (all unsigned short)
-        winsize = struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0)
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
         try:
             fcntl.ioctl(self._fd, termios.TIOCSWINSZ, winsize)
         except OSError:
