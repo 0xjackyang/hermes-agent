@@ -320,6 +320,74 @@ class TestLoadGatewayConfig:
             "456": "Therapist mode",
         }
 
+    def test_bridges_discord_auto_thread_free_response_channels_from_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  auto_thread_free_response_channels:\n"
+            "    - \"123\"\n"
+            "    - 456\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_AUTO_THREAD_FREE_RESPONSE_CHANNELS", raising=False)
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.DISCORD].extra[
+            "auto_thread_free_response_channels"
+        ] == ["123", 456]
+
+    def test_discord_auto_thread_free_response_channels_config_populates_env(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  auto_thread_free_response_channels:\n"
+            "    - \"123\"\n"
+            "    - 456\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_AUTO_THREAD_FREE_RESPONSE_CHANNELS", raising=False)
+
+        load_gateway_config()
+
+        assert (
+            os.environ.get("DISCORD_AUTO_THREAD_FREE_RESPONSE_CHANNELS") == "123,456"
+        )
+
+    def test_discord_auto_thread_free_response_channels_env_wins_over_config(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  auto_thread_free_response_channels:\n"
+            "    - from-config\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("DISCORD_AUTO_THREAD_FREE_RESPONSE_CHANNELS", "from-env")
+
+        load_gateway_config()
+
+        assert (
+            os.environ.get("DISCORD_AUTO_THREAD_FREE_RESPONSE_CHANNELS") == "from-env"
+        )
+
     def test_bridges_telegram_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
