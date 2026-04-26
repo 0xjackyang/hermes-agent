@@ -832,6 +832,84 @@ def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+class _FakeCodexStream:
+    def __init__(self):
+        self.final = type("Final", (), {"output": [], "usage": None})()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        return iter(())
+
+    def get_final_response(self):
+        return self.final
+
+
+class _FakeCodexResponses:
+    def __init__(self):
+        self.last_kwargs = None
+
+    def stream(self, **kwargs):
+        self.last_kwargs = kwargs
+        return _FakeCodexStream()
+
+
+class _FakeCodexClient:
+    def __init__(self):
+        self.responses = _FakeCodexResponses()
+
+
+class TestCodexAuxiliaryAdapter:
+    def test_sanitizes_tool_history_before_responses_call(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        client = _FakeCodexClient()
+        adapter = _CodexCompletionsAdapter(client, "gpt-5.5")
+
+        adapter.create(messages=[
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "remember what happened"},
+            {
+                "role": "assistant",
+                "content": "I will inspect that.",
+                "tool_calls": [{
+                    "id": "call_lookup",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": {"q": "alpha"}},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "alpha result"},
+        ])
+
+        sent_input = client.responses.last_kwargs["input"]
+        assert client.responses.last_kwargs["instructions"] == "system prompt"
+        assert all(item.get("role") != "tool" for item in sent_input)
+        assert not any(item.get("type") == "function_call_output" for item in sent_input)
+        assert "[Assistant tool call 1: lookup(" in sent_input[1]["content"]
+        assert '"q": "alpha"' in sent_input[1]["content"]
+        assert sent_input[2] == {
+            "role": "user",
+            "content": "[Tool result for call_lookup]\nalpha result",
+        }
+
+    def test_sanitized_tool_message_tolerates_missing_content_and_id(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        client = _FakeCodexClient()
+        adapter = _CodexCompletionsAdapter(client, "gpt-5.5")
+
+        adapter.create(messages=[{"role": "tool", "content": None}])
+
+        assert client.responses.last_kwargs["input"] == [
+            {"role": "user", "content": "[Tool result]\n"}
+        ]
+
+
 class TestIsConnectionError:
     """Tests for _is_connection_error detection."""
 
@@ -860,6 +938,23 @@ class TestIsConnectionError:
         from agent.auxiliary_client import _is_connection_error
         err = Exception("Internal Server Error")
         err.status_code = 500
+        assert _is_connection_error(err) is False
+
+    def test_peer_closed_incomplete_chunked_read(self):
+        from agent.auxiliary_client import _is_connection_error
+        err = Exception(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+        assert _is_connection_error(err) is True
+
+    def test_schema_400_tool_role_not_connection(self):
+        from agent.auxiliary_client import _is_connection_error
+        err = Exception(
+            "HTTP 400: Invalid value: 'tool'. Supported values are: "
+            "'assistant', 'system', 'developer', and 'user'."
+        )
+        err.status_code = 400
         assert _is_connection_error(err) is False
 
 

@@ -352,6 +352,98 @@ def _convert_content_for_responses(content: Any) -> Any:
     return converted or ""
 
 
+def _get_auxiliary_field(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _content_to_auxiliary_text(content: Any) -> str:
+    """Render arbitrary chat content as readable text for auxiliary tasks."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                if part:
+                    parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                if part is not None:
+                    parts.append(str(part))
+                continue
+
+            ptype = str(part.get("type") or "")
+            if ptype in ("text", "input_text", "output_text"):
+                text = part.get("text")
+                if text:
+                    parts.append(str(text))
+            elif ptype in ("image_url", "input_image"):
+                image_ref = part.get("image_url")
+                if isinstance(image_ref, dict):
+                    image_ref = image_ref.get("url")
+                if image_ref:
+                    parts.append(f"[Image: {image_ref}]")
+            else:
+                try:
+                    parts.append(json.dumps(part, ensure_ascii=False, sort_keys=True))
+                except Exception:
+                    parts.append(str(part))
+        return "\n".join(p for p in parts if p)
+
+    try:
+        return json.dumps(content, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(content)
+
+
+def _render_auxiliary_tool_calls(tool_calls: Any) -> str:
+    if not isinstance(tool_calls, list):
+        return ""
+
+    rendered: List[str] = []
+    for idx, tool_call in enumerate(tool_calls, start=1):
+        fn = _get_auxiliary_field(tool_call, "function", {})
+        name = _get_auxiliary_field(fn, "name", "") or "unknown"
+        arguments = _get_auxiliary_field(fn, "arguments", "")
+        if isinstance(arguments, dict):
+            arguments_text = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        elif arguments is None:
+            arguments_text = ""
+        else:
+            arguments_text = str(arguments)
+        rendered.append(f"[Assistant tool call {idx}: {name}({arguments_text})]")
+    return "\n".join(rendered)
+
+
+def _sanitize_codex_auxiliary_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten tool history into Responses-compatible auxiliary messages."""
+    role = msg.get("role", "user")
+    content = msg.get("content")
+
+    if role == "tool":
+        call_id = msg.get("tool_call_id") or msg.get("call_id")
+        label = f"[Tool result for {call_id}]" if call_id else "[Tool result]"
+        return {"role": "user", "content": f"{label}\n{_content_to_auxiliary_text(content)}"}
+
+    if role == "assistant":
+        tool_call_text = _render_auxiliary_tool_calls(msg.get("tool_calls"))
+        if tool_call_text:
+            text = _content_to_auxiliary_text(content).strip()
+            content = f"{text}\n{tool_call_text}" if text else tool_call_text
+        safe_content = content if content is not None else ""
+        return {"role": "assistant", "content": _convert_content_for_responses(safe_content)}
+
+    if role not in {"user", "assistant", "developer"}:
+        content = f"[{role} message]\n{_content_to_auxiliary_text(content)}"
+        role = "user"
+    safe_content = content if content is not None else ""
+    return {"role": role, "content": _convert_content_for_responses(safe_content)}
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -375,10 +467,7 @@ class _CodexCompletionsAdapter:
             if role == "system":
                 instructions = content if isinstance(content, str) else str(content)
             else:
-                input_msgs.append({
-                    "role": role,
-                    "content": _convert_content_for_responses(content),
-                })
+                input_msgs.append(_sanitize_codex_auxiliary_message(msg))
 
         resp_kwargs: Dict[str, Any] = {
             "model": model,
@@ -1328,13 +1417,14 @@ def _is_connection_error(exc: Exception) -> bool:
         return True
     # urllib3 / httpx / httpcore connection errors
     err_type = type(exc).__name__
-    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
+    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL", "RemoteProtocol")):
         return True
     err_lower = str(exc).lower()
     if any(kw in err_lower for kw in (
         "connection refused", "name or service not known",
         "no route to host", "network is unreachable",
         "timed out", "connection reset",
+        "peer closed", "incomplete chunked",
     )):
         return True
     return False
