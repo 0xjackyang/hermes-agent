@@ -1811,15 +1811,15 @@ class TestPtyWebSocket:
         monkeypatch.setattr(
             self.ws_module,
             "_resolve_chat_argv",
-            # sleep gives the test time to push the resize before tput runs
             lambda resume=None, sidecar_url=None: (
-                ["/bin/sh", "-c", "sleep 0.15; tput cols; tput lines"],
+                ["/bin/sh", "-c", "read _; tput cols; tput lines"],
                 None,
                 None,
             ),
         )
         with self.client.websocket_connect(self._url()) as conn:
             conn.send_text("\x1b[RESIZE:99;41]")
+            conn.send_bytes(b"\n")
             buf = b""
             import time
 
