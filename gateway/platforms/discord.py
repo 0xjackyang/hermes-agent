@@ -2714,21 +2714,48 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no", "off")
 
+    @staticmethod
+    def _parse_discord_channel_set(raw: Any) -> set:
+        """Parse Discord channel-id config from env/config scalar or sequence values."""
+        if raw is None or isinstance(raw, bool):
+            return set()
+        if isinstance(raw, str):
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            channel_ids = set()
+            for part in raw:
+                channel_ids.update(DiscordAdapter._parse_discord_channel_set(part))
+            return channel_ids
+        value = str(raw).strip()
+        return {value} if value else set()
+
+    def _discord_channel_set_from_env_or_config(self, env_var: str, config_key: str) -> set:
+        """Return a channel-id set with env vars taking precedence over config.extra."""
+        raw_env = os.getenv(env_var)
+        if raw_env is not None:
+            return self._parse_discord_channel_set(raw_env)
+        return self._parse_discord_channel_set(self.config.extra.get(config_key))
+
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs where no bot mention is required.
 
-        A single ``"*"`` entry (either from a list or a comma-separated
-        string) is preserved in the returned set so callers can short-circuit
-        on wildcard membership, consistent with ``allowed_channels``.
+        A single ``"*"`` entry (either from a list, scalar, or a
+        comma-separated string) is preserved in the returned set so callers can
+        short-circuit on wildcard membership, consistent with
+        ``allowed_channels``. ``DISCORD_FREE_RESPONSE_CHANNELS`` takes
+        precedence over ``discord.free_response_channels`` when set.
         """
-        raw = self.config.extra.get("free_response_channels")
-        if raw is None:
-            raw = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        if isinstance(raw, str) and raw.strip():
-            return {part.strip() for part in raw.split(",") if part.strip()}
-        return set()
+        return self._discord_channel_set_from_env_or_config(
+            "DISCORD_FREE_RESPONSE_CHANNELS",
+            "free_response_channels",
+        )
+
+    def _discord_auto_thread_free_response_channels(self) -> set:
+        """Return free-response parent channels that may still auto-thread."""
+        return self._discord_channel_set_from_env_or_config(
+            "DISCORD_AUTO_THREAD_FREE_RESPONSE_CHANNELS",
+            "auto_thread_free_response_channels",
+        )
 
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
@@ -3184,6 +3211,7 @@ class DiscordAdapter(BasePlatformAdapter):
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+        #   discord.auto_thread_free_response_channels: Free-response parent channels that still auto-thread
 
         thread_id = None
         parent_channel_id = None
@@ -3255,7 +3283,18 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
+            auto_thread_free_response_channels = self._discord_auto_thread_free_response_channels()
+            free_response_auto_thread_enabled = (
+                is_free_channel
+                and not is_voice_linked_channel
+                and (
+                    "*" in auto_thread_free_response_channels
+                    or bool(channel_ids & auto_thread_free_response_channels)
+                )
+            )
+            skip_thread = bool(channel_ids & no_thread_channels) or (
+                is_free_channel and not free_response_auto_thread_enabled
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -3312,6 +3351,7 @@ class DiscordAdapter(BasePlatformAdapter):
         chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
 
         # Build source
+        message_guild = getattr(message, "guild", None)
         source = self.build_source(
             chat_id=str(effective_channel.id),
             chat_name=chat_name,
@@ -3321,7 +3361,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             chat_topic=chat_topic,
             is_bot=getattr(message.author, "bot", False),
-            guild_id=str(message.guild.id) if message.guild else None,
+            guild_id=str(message_guild.id) if message_guild else None,
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
         )
