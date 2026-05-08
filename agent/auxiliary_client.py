@@ -34,12 +34,15 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
 import threading
 import time
-from pathlib import Path  # noqa: F401 — used by test mocks
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -665,6 +668,7 @@ class AnthropicAuxiliaryClient:
 
     def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False):
         self._real_client = real_client
+        self._is_oauth = is_oauth
         adapter = _AnthropicCompletionsAdapter(real_client, model, is_oauth=is_oauth)
         self.chat = _AnthropicChatShim(adapter)
         self.api_key = api_key
@@ -697,6 +701,7 @@ class AsyncAnthropicAuxiliaryClient:
         self.chat = _AsyncAnthropicChatShim(async_adapter)
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
+        self._is_oauth = getattr(sync_wrapper, "_is_oauth", False)
 
 
 def _read_nous_auth() -> Optional[dict]:
@@ -1346,7 +1351,14 @@ def _is_auth_error(exc: Exception) -> bool:
     if status == 401:
         return True
     err_lower = str(exc).lower()
-    return "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower()
+    return (
+        "error code: 401" in err_lower
+        or "http 401" in err_lower
+        or "status code 401" in err_lower
+        or "401 unauthorized" in err_lower
+        or "authentication token is expired" in err_lower
+        or "authenticationerror" in type(exc).__name__.lower()
+    )
 
 
 def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
@@ -1396,21 +1408,19 @@ def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
     normalized = _normalize_aux_provider(provider)
     with _client_cache_lock:
-        stale_keys = [
-            key for key in _client_cache
-            if _normalize_aux_provider(str(key[0])) == normalized
-        ]
-        for key in stale_keys:
-            client = _client_cache.get(key, (None, None, None))[0]
-            if client is not None:
-                _force_close_async_httpx(client)
-                try:
-                    close_fn = getattr(client, "close", None)
-                    if callable(close_fn):
-                        close_fn()
-                except Exception:
-                    pass
+        stale_entries = []
+        for key, entry in list(_client_cache.items()):
+            meta = _client_cache_meta.get(key)
+            key_provider = _normalize_aux_provider(str(key[0])) if key else ""
+            meta_effective = _normalize_aux_provider(getattr(meta, "effective_provider", None)) if meta else ""
+            meta_refresh = _normalize_aux_provider(getattr(meta, "refresh_provider", None)) if meta else ""
+            if normalized in (key_provider, meta_effective, meta_refresh):
+                stale_entries.append((key, entry))
+        for key, _entry in stale_entries:
             _client_cache.pop(key, None)
+            _client_cache_meta.pop(key, None)
+    for _key, entry in stale_entries:
+        _close_cached_client_entry(entry)
 
 
 def _refresh_provider_credentials(provider: str) -> bool:
@@ -1449,7 +1459,11 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
     except Exception as exc:
-        logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
+        logger.debug(
+            "Auxiliary provider credential refresh failed for %s (%s)",
+            normalized,
+            type(exc).__name__,
+        )
         return False
     return False
 
@@ -2085,6 +2099,192 @@ def resolve_provider_client(
     return None, None
 
 
+def resolve_provider_client_detailed(
+    provider: str,
+    model: str = None,
+    async_mode: bool = False,
+    raw_codex: bool = False,
+    explicit_base_url: str = None,
+    explicit_api_key: str = None,
+    api_mode: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> _AuxClientResolution:
+    """Detailed private provider resolution used by call paths that own retries."""
+    requested_provider = _normalize_aux_provider(provider)
+    if requested_provider == "auto":
+        info = _resolve_auto_detailed(main_runtime=main_runtime)
+        if info.client is None:
+            return _AuxClientResolution(
+                client=None,
+                model=None,
+                requested_provider="auto",
+                effective_provider=None,
+                refresh_provider=None,
+                auth_kind="unknown",
+            )
+        if model and "/" in model and info.model and "/" not in info.model:
+            logger.debug(
+                "Dropping OpenRouter-format model %r for non-OpenRouter auxiliary provider (using %r instead)",
+                model,
+                info.model,
+            )
+            model = None
+        final_model = model or info.model
+        client = info.client
+        if async_mode:
+            client, final_model = _to_async_client(client, final_model)
+        auth_kind = info.auth_kind
+        refresh_provider = _refresh_provider_for_resolution(info.effective_provider, auth_kind)
+        return _AuxClientResolution(
+            client=client,
+            model=final_model,
+            requested_provider="auto",
+            effective_provider=info.effective_provider,
+            refresh_provider=refresh_provider,
+            auth_kind=auth_kind,
+        )
+
+    client, resolved_model = resolve_provider_client(
+        requested_provider,
+        model,
+        async_mode,
+        raw_codex=raw_codex,
+        explicit_base_url=explicit_base_url,
+        explicit_api_key=explicit_api_key,
+        api_mode=api_mode,
+        main_runtime=main_runtime,
+    )
+    effective_provider = requested_provider if client is not None else None
+    auth_kind = _auth_kind_for_resolution(
+        effective_provider,
+        client,
+        explicit_base_url=explicit_base_url,
+        explicit_api_key=explicit_api_key,
+    )
+    # Direct custom/OpenAI-compatible routes may use Codex-shaped wrappers, but
+    # they are static/API-key routes and must not refresh Codex OAuth.
+    refresh_provider = _refresh_provider_for_resolution(effective_provider, auth_kind)
+    return _AuxClientResolution(
+        client=client,
+        model=resolved_model,
+        requested_provider=requested_provider,
+        effective_provider=effective_provider,
+        refresh_provider=refresh_provider,
+        auth_kind=auth_kind,
+    )
+
+
+def _resolution_for_auto_result(
+    *,
+    client: Any,
+    model: Optional[str],
+    requested_provider: str = "auto",
+    effective_provider: Optional[str],
+    explicit_base_url: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+) -> _AuxClientResolution:
+    auth_kind = _auth_kind_for_resolution(
+        effective_provider,
+        client,
+        explicit_base_url=explicit_base_url,
+        explicit_api_key=explicit_api_key,
+    )
+    return _AuxClientResolution(
+        client=client,
+        model=model,
+        requested_provider=requested_provider,
+        effective_provider=_normalize_aux_provider(effective_provider) if effective_provider else None,
+        refresh_provider=_refresh_provider_for_resolution(effective_provider, auth_kind),
+        auth_kind=auth_kind,
+    )
+
+
+def _resolve_auto_detailed(main_runtime: Optional[Dict[str, Any]] = None) -> _AuxClientResolution:
+    """Auto-detect an auxiliary client while preserving route/credential metadata."""
+    global auxiliary_is_nous, _stale_base_url_warned
+    auxiliary_is_nous = False
+    runtime = _normalize_main_runtime(main_runtime)
+    runtime_provider = runtime.get("provider", "")
+    runtime_model = runtime.get("model", "")
+    runtime_base_url = runtime.get("base_url", "")
+    runtime_api_key = runtime.get("api_key", "")
+    runtime_api_mode = runtime.get("api_mode", "")
+
+    if not _stale_base_url_warned:
+        _env_base = os.getenv("OPENAI_BASE_URL", "").strip()
+        _cfg_provider = runtime_provider or _read_main_provider()
+        if (_env_base and _cfg_provider
+                and _cfg_provider != "custom"
+                and not _cfg_provider.startswith("custom:")):
+            logger.warning(
+                "OPENAI_BASE_URL is set (%s) but model.provider is '%s'. "
+                "Auxiliary clients may route to the wrong endpoint. "
+                "Run: hermes model to reconfigure, or remove "
+                "OPENAI_BASE_URL from ~/.hermes/.env",
+                _env_base, _cfg_provider,
+            )
+            _stale_base_url_warned = True
+
+    main_provider = runtime_provider or _read_main_provider()
+    main_model = runtime_model or _read_main_model()
+    if (main_provider and main_model
+            and main_provider not in ("auto", "")):
+        resolved_provider = main_provider
+        explicit_base_url = None
+        explicit_api_key = None
+        if runtime_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
+            resolved_provider = "custom"
+            explicit_base_url = runtime_base_url
+            explicit_api_key = runtime_api_key or None
+        info = resolve_provider_client_detailed(
+            resolved_provider,
+            main_model,
+            explicit_base_url=explicit_base_url,
+            explicit_api_key=explicit_api_key,
+            api_mode=runtime_api_mode or None,
+        )
+        if info.client is not None:
+            logger.info("Auxiliary auto-detect: using main provider %s (%s)",
+                        main_provider, info.model or main_model)
+            return _AuxClientResolution(
+                client=info.client,
+                model=info.model or main_model,
+                requested_provider="auto",
+                effective_provider=info.effective_provider,
+                refresh_provider=info.refresh_provider,
+                auth_kind=info.auth_kind,
+            )
+
+    tried = []
+    for label, try_fn in _get_provider_chain():
+        client, model = try_fn()
+        if client is not None:
+            if tried:
+                logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
+                            label, model or "default", ", ".join(tried))
+            else:
+                logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
+            return _resolution_for_auto_result(
+                client=client,
+                model=model,
+                requested_provider="auto",
+                effective_provider=label,
+            )
+        tried.append(label)
+    logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
+                   "Compression, summarization, and memory flush will not work. "
+                   "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
+                   ", ".join(tried))
+    return _AuxClientResolution(
+        client=None,
+        model=None,
+        requested_provider="auto",
+        effective_provider=None,
+        refresh_provider=None,
+        auth_kind="unknown",
+    )
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def get_text_auxiliary_client(
@@ -2332,8 +2532,120 @@ def auxiliary_max_tokens_param(value: int) -> dict:
 # provider config rather than one per (config × event-loop), which previously
 # caused unbounded fd accumulation in long-running gateway processes (#10200).
 _client_cache: Dict[tuple, tuple] = {}
+_client_cache_meta: Dict[tuple, "_AuxClientResolution"] = {}
 _client_cache_lock = threading.Lock()
 _CLIENT_CACHE_MAX_SIZE = 64  # safety belt — evict oldest when exceeded
+
+
+@dataclass(frozen=True)
+class _AuxClientResolution:
+    client: Optional[Any]
+    model: Optional[str]
+    requested_provider: str
+    effective_provider: Optional[str]
+    refresh_provider: Optional[str]
+    auth_kind: str = "unknown"  # oauth | api_key | none | unknown
+    cache_key: Optional[tuple] = None
+
+
+_OAUTH_REFRESH_PROVIDERS = frozenset({"openai-codex", "nous", "anthropic"})
+
+
+def _anthropic_client_is_oauth(client: Any) -> bool:
+    """Return whether an Anthropic-shaped auxiliary client uses OAuth.
+
+    New wrappers stamp ``_is_oauth`` explicitly.  Older tests and a few
+    external call sites pass unannotated Anthropic-shaped clients; keep their
+    historical behavior by treating unknown Anthropic clients as refreshable,
+    while explicit ``False`` remains an API-key route.
+    """
+    client_dict = getattr(client, "__dict__", {}) or {}
+    if "_is_oauth" in client_dict:
+        return client_dict.get("_is_oauth") is True
+    try:
+        completions = getattr(getattr(client, "chat", None), "completions", None)
+        completions_dict = getattr(completions, "__dict__", {}) or {}
+        if "_is_oauth" in completions_dict:
+            return completions_dict.get("_is_oauth") is True
+    except Exception:
+        pass
+    return True
+
+
+def _auth_kind_for_resolution(
+    effective_provider: Optional[str],
+    client: Any,
+    *,
+    explicit_base_url: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+) -> str:
+    provider = _normalize_aux_provider(effective_provider)
+    if client is None:
+        return "unknown"
+    if provider in ("custom", "local/custom") or explicit_base_url:
+        return "none" if (explicit_base_url and not explicit_api_key) else "api_key"
+    if provider in ("openai-codex", "nous"):
+        return "oauth"
+    if provider == "anthropic":
+        return "oauth" if _anthropic_client_is_oauth(client) else "api_key"
+    if provider == "api-key":
+        return "api_key"
+    return "unknown"
+
+
+def _refresh_provider_for_resolution(effective_provider: Optional[str], auth_kind: str) -> Optional[str]:
+    provider = _normalize_aux_provider(effective_provider)
+    if auth_kind == "oauth" and provider in _OAUTH_REFRESH_PROVIDERS:
+        return provider
+    return None
+
+
+def _copy_resolution(
+    resolution: _AuxClientResolution,
+    *,
+    client: Any = None,
+    model: Optional[str] = None,
+    requested_provider: Optional[str] = None,
+    effective_provider: Optional[str] = None,
+    refresh_provider: Optional[str] = None,
+    auth_kind: Optional[str] = None,
+    cache_key: Optional[tuple] = None,
+) -> _AuxClientResolution:
+    return _AuxClientResolution(
+        client=resolution.client if client is None else client,
+        model=resolution.model if model is None else model,
+        requested_provider=resolution.requested_provider if requested_provider is None else requested_provider,
+        effective_provider=resolution.effective_provider if effective_provider is None else effective_provider,
+        refresh_provider=resolution.refresh_provider if refresh_provider is None else refresh_provider,
+        auth_kind=resolution.auth_kind if auth_kind is None else auth_kind,
+        cache_key=resolution.cache_key if cache_key is None else cache_key,
+    )
+
+
+def _close_cached_client_entry(entry: Optional[tuple]) -> None:
+    if entry is None:
+        return
+    client = entry[0]
+    if client is None:
+        return
+    _force_close_async_httpx(client)
+    try:
+        close_fn = getattr(client, "close", None)
+        if callable(close_fn):
+            close_fn()
+    except Exception:
+        pass
+
+
+def _evict_cached_client_key(cache_key: Optional[tuple]) -> bool:
+    """Evict one exact cache entry without logging the raw key material."""
+    if cache_key is None:
+        return False
+    with _client_cache_lock:
+        entry = _client_cache.pop(cache_key, None)
+        _client_cache_meta.pop(cache_key, None)
+    _close_cached_client_entry(entry)
+    return entry is not None
 
 
 def _client_cache_key(
@@ -2345,23 +2657,85 @@ def _client_cache_key(
     api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
 ) -> tuple:
+    provider = _normalize_aux_provider(provider)
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
     return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key)
 
 
-def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
+def _resolution_from_cache_or_client(
+    provider: str,
+    client: Any,
+    model: Optional[str],
+    *,
+    async_mode: bool,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    effective_provider: Optional[str] = None,
+) -> _AuxClientResolution:
+    """Return route/auth metadata for a cached-client result.
+
+    The cache key may contain API-key material, so callers should keep this
+    object internal and never log ``cache_key`` directly.
+    """
+    requested_provider = _normalize_aux_provider(provider)
+    cache_key = _client_cache_key(
+        requested_provider,
+        async_mode=async_mode,
+        base_url=base_url,
+        api_key=api_key,
+        api_mode=api_mode,
+        main_runtime=main_runtime,
+    )
+    with _client_cache_lock:
+        cached_resolution = _client_cache_meta.get(cache_key)
+    if cached_resolution is not None:
+        return _copy_resolution(
+            cached_resolution,
+            client=client,
+            model=model,
+            cache_key=cache_key,
+        )
+
+    resolved_effective = _normalize_aux_provider(effective_provider) if effective_provider else None
+    if resolved_effective is None and requested_provider != "auto" and client is not None:
+        resolved_effective = requested_provider
+    auth_kind = _auth_kind_for_resolution(
+        resolved_effective,
+        client,
+        explicit_base_url=base_url,
+        explicit_api_key=api_key,
+    )
+    return _AuxClientResolution(
+        client=client,
+        model=model,
+        requested_provider=requested_provider,
+        effective_provider=resolved_effective if client is not None else None,
+        refresh_provider=_refresh_provider_for_resolution(resolved_effective, auth_kind),
+        auth_kind=auth_kind,
+        cache_key=cache_key,
+    )
+
+
+def _store_cached_client(
+    cache_key: tuple,
+    client: Any,
+    default_model: Optional[str],
+    *,
+    bound_loop: Any = None,
+    resolution: Optional[_AuxClientResolution] = None,
+) -> None:
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
-            _force_close_async_httpx(old_entry[0])
-            try:
-                close_fn = getattr(old_entry[0], "close", None)
-                if callable(close_fn):
-                    close_fn()
-            except Exception:
-                pass
+            _close_cached_client_entry(old_entry)
         _client_cache[cache_key] = (client, default_model, bound_loop)
+        if resolution is not None:
+            _client_cache_meta[cache_key] = _copy_resolution(resolution, cache_key=cache_key)
+        else:
+            _client_cache_meta.pop(cache_key, None)
 
 
 def _refresh_nous_auxiliary_client(
@@ -2402,7 +2776,22 @@ def _refresh_nous_auxiliary_client(
         api_mode=api_mode,
         main_runtime=main_runtime,
     )
-    _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
+    resolution = _AuxClientResolution(
+        client=client,
+        model=final_model,
+        requested_provider=_normalize_aux_provider(cache_provider),
+        effective_provider="nous",
+        refresh_provider="nous",
+        auth_kind="oauth",
+        cache_key=cache_key,
+    )
+    _store_cached_client(
+        cache_key,
+        client,
+        final_model,
+        bound_loop=current_loop,
+        resolution=resolution,
+    )
     return client, final_model
 
 
@@ -2484,6 +2873,7 @@ def shutdown_cached_clients() -> None:
             except Exception:
                 pass
         _client_cache.clear()
+        _client_cache_meta.clear()
 
 
 def cleanup_stale_async_clients() -> None:
@@ -2503,6 +2893,7 @@ def cleanup_stale_async_clients() -> None:
                 stale_keys.append(key)
         for key in stale_keys:
             del _client_cache[key]
+            _client_cache_meta.pop(key, None)
 
 
 def _is_openrouter_client(client: Any) -> bool:
@@ -2558,15 +2949,17 @@ def _get_cached_client(
             current_loop = _aio.get_event_loop()
         except RuntimeError:
             pass
+    cache_provider = _normalize_aux_provider(provider)
     runtime = _normalize_main_runtime(main_runtime)
     cache_key = _client_cache_key(
-        provider,
+        cache_provider,
         async_mode=async_mode,
         base_url=base_url,
         api_key=api_key,
         api_mode=api_mode,
-        main_runtime=main_runtime,
+        main_runtime=runtime,
     )
+    stale_entry = None
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
@@ -2583,14 +2976,17 @@ def _get_cached_client(
                     effective = _compat_model(cached_client, model, cached_default)
                     return cached_client, effective
                 # Stale — evict and fall through to create a new client.
-                _force_close_async_httpx(cached_client)
-                del _client_cache[cache_key]
+                stale_entry = _client_cache.pop(cache_key, None)
+                _client_cache_meta.pop(cache_key, None)
             else:
                 effective = _compat_model(cached_client, model, cached_default)
                 return cached_client, effective
-    # Build outside the lock
-    client, default_model = resolve_provider_client(
-        provider,
+    if stale_entry is not None:
+        _close_cached_client_entry(stale_entry)
+
+    # Build outside the lock.
+    resolution = resolve_provider_client_detailed(
+        cache_provider,
         model,
         async_mode,
         explicit_base_url=base_url,
@@ -2598,21 +2994,39 @@ def _get_cached_client(
         api_mode=api_mode,
         main_runtime=runtime,
     )
+    client = resolution.client
+    default_model = resolution.model
     if client is not None:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
+        evicted_entries = []
+        built_entry = (client, default_model, bound_loop)
         with _client_cache_lock:
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
                 # the oldest entries (FIFO — dict preserves insertion order).
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
                     evict_key, evict_entry = next(iter(_client_cache.items()))
-                    _force_close_async_httpx(evict_entry[0])
+                    evicted_entries.append(evict_entry)
                     del _client_cache[evict_key]
-                _client_cache[cache_key] = (client, default_model, bound_loop)
+                    _client_cache_meta.pop(evict_key, None)
+                _client_cache[cache_key] = built_entry
+                _client_cache_meta[cache_key] = _copy_resolution(
+                    resolution,
+                    cache_key=cache_key,
+                )
             else:
-                client, default_model, _ = _client_cache[cache_key]
+                cached_client, cached_default, _ = _client_cache[cache_key]
+                _client_cache_meta.setdefault(
+                    cache_key,
+                    _copy_resolution(resolution, client=cached_client, model=cached_default, cache_key=cache_key),
+                )
+                if cached_client is not client:
+                    evicted_entries.append(built_entry)
+                client, default_model = cached_client, cached_default
+        for entry in evicted_entries:
+            _close_cached_client_entry(entry)
     return client, model or default_model
 
 
@@ -2913,6 +3327,7 @@ def call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    active_resolution: Optional[_AuxClientResolution] = None
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -2937,8 +3352,18 @@ def call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup"
             )
+        requested_vision_provider = _normalize_aux_provider(resolved_provider)
         resolved_provider = effective_provider or resolved_provider
+        active_resolution = _resolution_for_auto_result(
+            client=client,
+            model=final_model,
+            requested_provider=requested_vision_provider,
+            effective_provider=resolved_provider,
+            explicit_base_url=resolved_base_url,
+            explicit_api_key=resolved_api_key,
+        )
     else:
+        cache_provider_used = resolved_provider
         client, final_model = _get_cached_client(
             resolved_provider,
             resolved_model,
@@ -2966,33 +3391,50 @@ def call_llm(
             if not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
+                cache_provider_used = "auto"
                 client, final_model = _get_cached_client("auto", main_runtime=main_runtime)
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
+        active_resolution = _resolution_from_cache_or_client(
+            cache_provider_used,
+            client,
+            final_model,
+            async_mode=False,
+            base_url=resolved_base_url,
+            api_key=resolved_api_key,
+            api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
+        )
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
+
+    call_provider = (
+        active_resolution.effective_provider
+        if active_resolution and active_resolution.effective_provider
+        else resolved_provider
+    )
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
-                     task, resolved_provider or "auto", final_model or "default",
+                     task, call_provider or resolved_provider or "auto", final_model or "default",
                      f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
+        call_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         base_url=_base_info or resolved_base_url)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+    if _is_anthropic_compat_endpoint(call_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
@@ -3046,14 +3488,11 @@ def call_llm(
                     raise
                 first_err = retry_err
 
-        # ── Nous auth refresh parity with main agent ──────────────────
-        client_is_nous = (
-            resolved_provider == "nous"
-            or base_url_host_matches(_base_info, "inference-api.nousresearch.com")
-        )
-        if _is_auth_error(first_err) and client_is_nous:
+        # ── Auth refresh retry ───────────────────────────────────────
+        refresh_provider = active_resolution.refresh_provider if active_resolution else None
+        if _is_auth_error(first_err) and refresh_provider == "nous":
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
-                cache_provider=resolved_provider or "nous",
+                cache_provider=(active_resolution.requested_provider if active_resolution else resolved_provider) or "nous",
                 model=final_model,
                 async_mode=False,
                 base_url=resolved_base_url,
@@ -3069,45 +3508,60 @@ def call_llm(
                 return _validate_llm_response(
                     refreshed_client.chat.completions.create(**kwargs), task)
 
-        # ── Auth refresh retry ───────────────────────────────────────
-        if (_is_auth_error(first_err)
-                and resolved_provider not in ("auto", "", None)
-                and not client_is_nous):
-            if _refresh_provider_credentials(resolved_provider):
+        if _is_auth_error(first_err) and refresh_provider and refresh_provider != "nous":
+            if _refresh_provider_credentials(refresh_provider):
+                _evict_cached_client_key(active_resolution.cache_key if active_resolution else None)
                 logger.info(
                     "Auxiliary %s: refreshed %s credentials after auth error, retrying",
-                    task or "call", resolved_provider,
+                    task or "call", refresh_provider,
                 )
-                retry_client, retry_model = (
-                    resolve_vision_provider_client(
-                        provider=resolved_provider,
+                retry_requested_provider = (
+                    active_resolution.requested_provider if active_resolution else resolved_provider
+                ) or resolved_provider
+                if task == "vision":
+                    retry_effective, retry_client, retry_model = resolve_vision_provider_client(
+                        provider=retry_requested_provider,
                         model=final_model,
                         async_mode=False,
-                    )[1:]
-                    if task == "vision"
-                    else _get_cached_client(
-                        resolved_provider,
+                    )
+                    retry_resolution = _resolution_for_auto_result(
+                        client=retry_client,
+                        model=retry_model,
+                        requested_provider=retry_requested_provider,
+                        effective_provider=retry_effective,
+                        explicit_base_url=resolved_base_url,
+                        explicit_api_key=resolved_api_key,
+                    ) if retry_client is not None else None
+                else:
+                    retry_client, retry_model = _get_cached_client(
+                        retry_requested_provider,
                         resolved_model,
                         base_url=resolved_base_url,
                         api_key=resolved_api_key,
                         api_mode=resolved_api_mode,
                         main_runtime=main_runtime,
                     )
-                )
-                if retry_client is not None:
-                    retry_kwargs = _build_call_kwargs(
-                        resolved_provider,
-                        retry_model or final_model,
-                        messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        timeout=effective_timeout,
-                        extra_body=effective_extra_body,
+                    retry_resolution = _resolution_from_cache_or_client(
+                        retry_requested_provider,
+                        retry_client,
+                        retry_model,
+                        async_mode=False,
                         base_url=resolved_base_url,
+                        api_key=resolved_api_key,
+                        api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
+                    ) if retry_client is not None else None
+                if retry_client is not None:
+                    retry_provider = (
+                        retry_resolution.effective_provider
+                        if retry_resolution and retry_resolution.effective_provider
+                        else refresh_provider
                     )
+                    retry_kwargs = dict(kwargs)
+                    if retry_model and retry_model != retry_kwargs.get("model"):
+                        retry_kwargs["model"] = retry_model
                     _retry_base = str(getattr(retry_client, "base_url", "") or "")
-                    if _is_anthropic_compat_endpoint(resolved_provider, _retry_base):
+                    if _is_anthropic_compat_endpoint(retry_provider, _retry_base):
                         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
@@ -3210,6 +3664,7 @@ async def async_call_llm(
     model: str = None,
     base_url: str = None,
     api_key: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
     messages: list,
     temperature: float = None,
     max_tokens: int = None,
@@ -3225,6 +3680,7 @@ async def async_call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    active_resolution: Optional[_AuxClientResolution] = None
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -3249,8 +3705,18 @@ async def async_call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup"
             )
+        requested_vision_provider = _normalize_aux_provider(resolved_provider)
         resolved_provider = effective_provider or resolved_provider
+        active_resolution = _resolution_for_auto_result(
+            client=client,
+            model=final_model,
+            requested_provider=requested_vision_provider,
+            effective_provider=resolved_provider,
+            explicit_base_url=resolved_base_url,
+            explicit_api_key=resolved_api_key,
+        )
     else:
+        cache_provider_used = resolved_provider
         client, final_model = _get_cached_client(
             resolved_provider,
             resolved_model,
@@ -3258,6 +3724,7 @@ async def async_call_llm(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
@@ -3270,26 +3737,46 @@ async def async_call_llm(
             if not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", async_mode=True)
+                cache_provider_used = "auto"
+                client, final_model = _get_cached_client(
+                    "auto",
+                    async_mode=True,
+                    main_runtime=main_runtime,
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
+        active_resolution = _resolution_from_cache_or_client(
+            cache_provider_used,
+            client,
+            final_model,
+            async_mode=True,
+            base_url=resolved_base_url,
+            api_key=resolved_api_key,
+            api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
+        )
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
+    call_provider = (
+        active_resolution.effective_provider
+        if active_resolution and active_resolution.effective_provider
+        else resolved_provider
+    )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
     kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
+        call_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         base_url=_client_base or resolved_base_url)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+    if _is_anthropic_compat_endpoint(call_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
@@ -3337,19 +3824,17 @@ async def async_call_llm(
                     raise
                 first_err = retry_err
 
-        # ── Nous auth refresh parity with main agent ──────────────────
-        client_is_nous = (
-            resolved_provider == "nous"
-            or base_url_host_matches(_client_base, "inference-api.nousresearch.com")
-        )
-        if _is_auth_error(first_err) and client_is_nous:
+        # ── Auth refresh retry ───────────────────────────────────────
+        refresh_provider = active_resolution.refresh_provider if active_resolution else None
+        if _is_auth_error(first_err) and refresh_provider == "nous":
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
-                cache_provider=resolved_provider or "nous",
+                cache_provider=(active_resolution.requested_provider if active_resolution else resolved_provider) or "nous",
                 model=final_model,
                 async_mode=True,
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
             )
             if refreshed_client is not None:
                 logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
@@ -3359,44 +3844,61 @@ async def async_call_llm(
                 return _validate_llm_response(
                     await refreshed_client.chat.completions.create(**kwargs), task)
 
-        # ── Auth refresh retry (mirrors sync call_llm) ───────────────
-        if (_is_auth_error(first_err)
-                and resolved_provider not in ("auto", "", None)
-                and not client_is_nous):
-            if _refresh_provider_credentials(resolved_provider):
+        if _is_auth_error(first_err) and refresh_provider and refresh_provider != "nous":
+            if _refresh_provider_credentials(refresh_provider):
+                _evict_cached_client_key(active_resolution.cache_key if active_resolution else None)
                 logger.info(
                     "Auxiliary %s (async): refreshed %s credentials after auth error, retrying",
-                    task or "call", resolved_provider,
+                    task or "call", refresh_provider,
                 )
+                retry_requested_provider = (
+                    active_resolution.requested_provider if active_resolution else resolved_provider
+                ) or resolved_provider
                 if task == "vision":
-                    _, retry_client, retry_model = resolve_vision_provider_client(
-                        provider=resolved_provider,
+                    retry_effective, retry_client, retry_model = resolve_vision_provider_client(
+                        provider=retry_requested_provider,
                         model=final_model,
                         async_mode=True,
                     )
+                    retry_resolution = _resolution_for_auto_result(
+                        client=retry_client,
+                        model=retry_model,
+                        requested_provider=retry_requested_provider,
+                        effective_provider=retry_effective,
+                        explicit_base_url=resolved_base_url,
+                        explicit_api_key=resolved_api_key,
+                    ) if retry_client is not None else None
                 else:
                     retry_client, retry_model = _get_cached_client(
-                        resolved_provider,
+                        retry_requested_provider,
                         resolved_model,
                         async_mode=True,
                         base_url=resolved_base_url,
                         api_key=resolved_api_key,
                         api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
                     )
-                if retry_client is not None:
-                    retry_kwargs = _build_call_kwargs(
-                        resolved_provider,
-                        retry_model or final_model,
-                        messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        timeout=effective_timeout,
-                        extra_body=effective_extra_body,
+                    retry_resolution = _resolution_from_cache_or_client(
+                        retry_requested_provider,
+                        retry_client,
+                        retry_model,
+                        async_mode=True,
                         base_url=resolved_base_url,
+                        api_key=resolved_api_key,
+                        api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
+                    ) if retry_client is not None else None
+                if retry_client is not None:
+                    retry_provider = (
+                        retry_resolution.effective_provider
+                        if retry_resolution and retry_resolution.effective_provider
+                        else refresh_provider
                     )
+                    retry_kwargs = dict(kwargs)
+                    if retry_model and retry_model != retry_kwargs.get("model"):
+                        retry_kwargs["model"] = retry_model
                     _retry_base = str(getattr(retry_client, "base_url", "") or "")
-                    if _is_anthropic_compat_endpoint(resolved_provider, _retry_base):
+                    if _is_anthropic_compat_endpoint(retry_provider, _retry_base):
                         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)

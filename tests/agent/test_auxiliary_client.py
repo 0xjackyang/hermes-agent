@@ -1252,6 +1252,62 @@ class _AsyncFailingThenSuccessCompletions:
 
 
 class TestAuxiliaryAuthRefreshRetry:
+    def test_call_llm_auto_codex_401_refreshes_effective_provider_and_evicts_exact_cache_key(self):
+        import agent.auxiliary_client as ac
+
+        ac._client_cache.clear()
+        main_runtime = {
+            "provider": "openai-codex",
+            "model": "gpt-5.2-codex",
+        }
+        stale_key = ac._client_cache_key(
+            "auto",
+            async_mode=False,
+            main_runtime=main_runtime,
+        )
+
+        stale_client = MagicMock()
+        stale_client.base_url = "https://chatgpt.com/backend-api/codex"
+        stale_client.chat.completions.create.side_effect = _AuxAuth401("HTTP 401: Provided authentication token is expired")
+
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://chatgpt.com/backend-api/codex"
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh-auto-codex")
+
+        with (
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={}),
+            patch("agent.auxiliary_client._try_codex", side_effect=[
+                (stale_client, "gpt-5.2-codex"),
+                (fresh_client, "gpt-5.2-codex"),
+            ]),
+            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True) as mock_refresh,
+        ):
+            seeded_client, seeded_model = ac._get_cached_client(
+                "auto",
+                main_runtime=main_runtime,
+            )
+            assert seeded_client is stale_client
+            assert seeded_model == "gpt-5.2-codex"
+            assert ac._client_cache[stale_key][0] is stale_client
+
+            resp = call_llm(
+                task="flush_memories",
+                main_runtime=main_runtime,
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert resp.choices[0].message.content == "fresh-auto-codex"
+        mock_refresh.assert_called_once_with("openai-codex")
+        assert stale_client.chat.completions.create.call_count == 1
+        assert fresh_client.chat.completions.create.call_count == 1
+        assert ac._client_cache[stale_key][0] is fresh_client
+        meta = ac._client_cache_meta[stale_key]
+        assert meta.requested_provider == "auto"
+        assert meta.effective_provider == "openai-codex"
+        assert meta.refresh_provider == "openai-codex"
+        assert meta.auth_kind == "oauth"
+        assert meta.cache_key == stale_key
+
     def test_call_llm_refreshes_codex_on_401_for_vision(self):
         failing_client = MagicMock()
         failing_client.base_url = "https://chatgpt.com/backend-api/codex"
@@ -1413,3 +1469,206 @@ class TestAuxiliaryAuthRefreshRetry:
         mock_refresh.assert_called_once_with("anthropic")
         assert stale_client.chat.completions.create.await_count == 1
         assert fresh_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_refreshes_auto_codex_and_evicts_exact_cache_key(self):
+        from agent import auxiliary_client as ac
+
+        ac.shutdown_cached_clients()
+        main_runtime = {
+            "provider": "openai-codex",
+            "model": "gpt-5.2-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "runtime-secret-token",
+            "api_mode": "codex_responses",
+        }
+        stale_client = MagicMock()
+        stale_client.base_url = "https://chatgpt.com/backend-api/codex"
+        stale_client.chat.completions.create = AsyncMock(side_effect=_AuxAuth401("expired codex token"))
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://chatgpt.com/backend-api/codex"
+        fresh_client.chat.completions.create = AsyncMock(return_value=_DummyResponse("fresh-async-auto-codex"))
+
+        stale_resolution = ac._AuxClientResolution(
+            client=stale_client,
+            model="gpt-5.2-codex",
+            requested_provider="auto",
+            effective_provider="openai-codex",
+            refresh_provider="openai-codex",
+            auth_kind="oauth",
+        )
+        fresh_resolution = ac._AuxClientResolution(
+            client=fresh_client,
+            model="gpt-5.2-codex",
+            requested_provider="auto",
+            effective_provider="openai-codex",
+            refresh_provider="openai-codex",
+            auth_kind="oauth",
+        )
+        stale_key = ac._client_cache_key("auto", async_mode=True, main_runtime=main_runtime)
+
+        try:
+            with (
+                patch("agent.auxiliary_client.resolve_provider_client_detailed", side_effect=[stale_resolution, fresh_resolution]),
+                patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True) as mock_refresh,
+            ):
+                seeded_client, seeded_model = ac._get_cached_client(
+                    "auto",
+                    async_mode=True,
+                    main_runtime=main_runtime,
+                )
+                assert seeded_client is stale_client
+                assert seeded_model == "gpt-5.2-codex"
+                assert ac._client_cache[stale_key][0] is stale_client
+
+                resp = await async_call_llm(
+                    task="flush_memories",
+                    main_runtime=main_runtime,
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+                meta = ac._client_cache_meta[stale_key]
+                assert meta.requested_provider == "auto"
+                assert meta.effective_provider == "openai-codex"
+                assert meta.refresh_provider == "openai-codex"
+                assert meta.auth_kind == "oauth"
+                assert meta.cache_key == stale_key
+        finally:
+            ac.shutdown_cached_clients()
+
+        assert resp.choices[0].message.content == "fresh-async-auto-codex"
+        mock_refresh.assert_called_once_with("openai-codex")
+        assert stale_client.chat.completions.create.await_count == 1
+        assert fresh_client.chat.completions.create.await_count == 1
+
+    def test_call_llm_does_not_refresh_custom_api_key_route_on_401(self):
+        stale_client = MagicMock()
+        stale_client.base_url = "https://custom.example/v1"
+        stale_client.chat.completions.create.side_effect = _AuxAuth401("custom key rejected")
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("custom", "custom-model", "https://custom.example/v1", "custom-secret-key", "chat_completions"),
+            ),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(stale_client, "custom-model")),
+            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True) as mock_refresh,
+            pytest.raises(_AuxAuth401),
+        ):
+            call_llm(
+                task="compression",
+                provider="custom",
+                model="custom-model",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        mock_refresh.assert_not_called()
+
+    def test_call_llm_does_not_refresh_explicit_anthropic_api_key_route_on_401(self):
+        stale_client = MagicMock()
+        stale_client._is_oauth = False
+        stale_client.base_url = "https://api.anthropic.com"
+        stale_client.chat.completions.create.side_effect = _AuxAuth401("anthropic api key rejected")
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("anthropic", "claude-haiku-4-5-20251001", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(stale_client, "claude-haiku-4-5-20251001")),
+            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True) as mock_refresh,
+            pytest.raises(_AuxAuth401),
+        ):
+            call_llm(
+                task="compression",
+                provider="anthropic",
+                model="claude-haiku-4-5-20251001",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        mock_refresh.assert_not_called()
+
+    def test_auto_codex_auth_refresh_logs_do_not_leak_cache_key_material(self, caplog):
+        from agent import auxiliary_client as ac
+
+        ac.shutdown_cached_clients()
+        main_runtime = {
+            "provider": "openai-codex",
+            "model": "gpt-5.2-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "runtime-secret-token",
+            "api_mode": "codex_responses",
+        }
+        stale_client = MagicMock()
+        stale_client.base_url = "https://chatgpt.com/backend-api/codex"
+        stale_client.chat.completions.create.side_effect = _AuxAuth401("expired codex token")
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://chatgpt.com/backend-api/codex"
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh-without-secret-log")
+        stale_key = ac._client_cache_key("auto", async_mode=False, main_runtime=main_runtime)
+
+        try:
+            with (
+                caplog.at_level(logging.INFO),
+                patch("agent.auxiliary_client.resolve_provider_client_detailed", side_effect=[
+                    ac._AuxClientResolution(
+                        client=stale_client,
+                        model="gpt-5.2-codex",
+                        requested_provider="auto",
+                        effective_provider="openai-codex",
+                        refresh_provider="openai-codex",
+                        auth_kind="oauth",
+                    ),
+                    ac._AuxClientResolution(
+                        client=fresh_client,
+                        model="gpt-5.2-codex",
+                        requested_provider="auto",
+                        effective_provider="openai-codex",
+                        refresh_provider="openai-codex",
+                        auth_kind="oauth",
+                    ),
+                ]),
+                patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True),
+            ):
+                seeded_client, _ = ac._get_cached_client("auto", main_runtime=main_runtime)
+                assert seeded_client is stale_client
+                assert ac._client_cache[stale_key][0] is stale_client
+                resp = call_llm(
+                    task="flush_memories",
+                    main_runtime=main_runtime,
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+        finally:
+            ac.shutdown_cached_clients()
+
+        assert resp.choices[0].message.content == "fresh-without-secret-log"
+        assert "runtime-secret-token" not in caplog.text
+        assert "expired codex token" not in caplog.text
+
+    def test_refresh_nous_auxiliary_client_preserves_auto_resolution_metadata(self):
+        from agent import auxiliary_client as ac
+
+        ac.shutdown_cached_clients()
+        main_runtime = {"provider": "nous", "model": "Hermes-4-70B"}
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://inference-api.nousresearch.com/v1"
+        stale_key = ac._client_cache_key("auto", async_mode=False, main_runtime=main_runtime)
+
+        try:
+            with (
+                patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-nous-key", "https://inference-api.nousresearch.com/v1")),
+                patch("agent.auxiliary_client.OpenAI", return_value=fresh_client),
+            ):
+                refreshed_client, refreshed_model = ac._refresh_nous_auxiliary_client(
+                    cache_provider="auto",
+                    model="Hermes-4-70B",
+                    async_mode=False,
+                    main_runtime=main_runtime,
+                )
+                assert refreshed_client is fresh_client
+                assert refreshed_model == "Hermes-4-70B"
+                assert ac._client_cache[stale_key][0] is fresh_client
+                meta = ac._client_cache_meta[stale_key]
+                assert meta.requested_provider == "auto"
+                assert meta.effective_provider == "nous"
+                assert meta.refresh_provider == "nous"
+                assert meta.auth_kind == "oauth"
+                assert meta.cache_key == stale_key
+        finally:
+            ac.shutdown_cached_clients()
