@@ -54,6 +54,99 @@ class TestCodexBuildKwargs:
         assert "input" in kw
         assert kw["store"] is False
 
+    def test_positive_finite_timeout_passes_through(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            timeout=123.5,
+        )
+        assert kw["timeout"] == 123.5
+
+    @pytest.mark.parametrize("bad_timeout", [0, -1, "slow", True, None, float("inf"), float("nan")])
+    def test_invalid_timeout_is_omitted(self, transport, bad_timeout):
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            timeout=bad_timeout,
+        )
+        assert "timeout" not in kw
+
+    @pytest.mark.parametrize("model", ["gpt-5.5", "codex-gpt-5.5", "openai/gpt-5.5-pro"])
+    def test_gpt55_codex_backend_strips_incompatible_kwargs(self, transport, model):
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            timeout=123.5,
+            reasoning_config={"effort": "high"},
+            request_overrides={
+                "reasoning": {"effort": "xhigh"},
+                "include": ["reasoning.encrypted_content"],
+                "store": False,
+            },
+        )
+        assert kw["timeout"] == 123.5
+        assert "reasoning" not in kw
+        assert "include" not in kw
+        assert "store" not in kw
+
+    def test_non_gpt55_codex_backend_keeps_existing_responses_kwargs(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            reasoning_config={"effort": "high"},
+        )
+        assert kw["store"] is False
+        assert kw["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert kw["include"] == ["reasoning.encrypted_content"]
+
+    def test_gpt55_non_codex_backend_keeps_existing_responses_kwargs(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=False,
+            reasoning_config={"effort": "high"},
+        )
+        assert kw["store"] is False
+        assert kw["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert kw["include"] == ["reasoning.encrypted_content"]
+
+    def test_preflight_gpt55_codex_backend_strips_post_normalized_kwargs(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            timeout=123.5,
+            reasoning_config={"effort": "high"},
+        )
+        preflight = transport.preflight_kwargs(kw, is_codex_backend=True)
+
+        assert preflight["timeout"] == 123.5
+        assert "reasoning" not in preflight
+        assert "include" not in preflight
+        assert "store" not in preflight
+
+    def test_preflight_gpt55_non_codex_backend_keeps_responses_kwargs(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=False,
+            reasoning_config={"effort": "high"},
+        )
+        preflight = transport.preflight_kwargs(kw, is_codex_backend=False)
+
+        assert preflight["store"] is False
+        assert preflight["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert preflight["include"] == ["reasoning.encrypted_content"]
+
     def test_system_extracted_from_messages(self, transport):
         messages = [
             {"role": "system", "content": "Custom system prompt"},

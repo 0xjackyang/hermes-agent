@@ -5,10 +5,28 @@ This transport owns format conversion and normalization — NOT client lifecycle
 streaming, or the _run_codex_stream() call path.
 """
 
+import math
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
+
+
+def _is_positive_finite_numeric(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and value > 0
+    )
+
+
+def _is_gpt55_codex_model(model: str) -> bool:
+    """Return True for GPT-5.5 models on the ChatGPT Codex backend."""
+    model_name = (model or "").strip().lower()
+    if "/" in model_name:
+        model_name = model_name.rsplit("/", 1)[-1]
+    return model_name.startswith(("gpt-5.5", "codex-gpt-5.5"))
 
 
 class ResponsesApiTransport(ProviderTransport):
@@ -103,6 +121,10 @@ class ResponsesApiTransport(ProviderTransport):
             "tools": response_tools,
             "store": False,
         }
+        timeout = params.get("timeout")
+        if _is_positive_finite_numeric(timeout):
+            kwargs["timeout"] = timeout
+
         if response_tools:
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
@@ -193,6 +215,13 @@ class ResponsesApiTransport(ProviderTransport):
             merged_extra_body.setdefault("prompt_cache_key", session_id)
             kwargs["extra_body"] = merged_extra_body
 
+        if is_codex_backend and _is_gpt55_codex_model(model):
+            # The ChatGPT Codex backend rejects or stalls on these Responses
+            # kwargs for GPT-5.5. Strip them last so request_overrides cannot
+            # accidentally reintroduce the incompatible fields.
+            for unsupported_key in ("reasoning", "include", "store"):
+                kwargs.pop(unsupported_key, None)
+
         return kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
@@ -252,13 +281,27 @@ class ResponsesApiTransport(ProviderTransport):
             return False
         return True
 
-    def preflight_kwargs(self, api_kwargs: Any, *, allow_stream: bool = False) -> dict:
+    def preflight_kwargs(
+        self,
+        api_kwargs: Any,
+        *,
+        allow_stream: bool = False,
+        is_codex_backend: bool = False,
+    ) -> dict:
         """Validate and sanitize Codex API kwargs before the call.
 
         Normalizes input items, strips unsupported fields, validates structure.
         """
         from agent.codex_responses_adapter import _preflight_codex_api_kwargs
-        return _preflight_codex_api_kwargs(api_kwargs, allow_stream=allow_stream)
+        normalized = _preflight_codex_api_kwargs(api_kwargs, allow_stream=allow_stream)
+        if is_codex_backend and _is_gpt55_codex_model(str(normalized.get("model") or "")):
+            # The adapter normalizes missing ``store`` back to ``False`` for
+            # ordinary Responses requests. GPT-5.5 on the ChatGPT Codex backend
+            # rejects/stalls on these kwargs, so strip them after normalization
+            # too — including the create(stream=True) fallback path.
+            for unsupported_key in ("reasoning", "include", "store"):
+                normalized.pop(unsupported_key, None)
+        return normalized
 
     def map_finish_reason(self, raw_reason: str) -> str:
         """Map Codex response.status to OpenAI finish_reason.

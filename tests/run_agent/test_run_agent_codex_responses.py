@@ -308,9 +308,41 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert kwargs["parallel_tool_calls"] is True
     assert isinstance(kwargs["prompt_cache_key"], str)
     assert len(kwargs["prompt_cache_key"]) > 0
-    assert "timeout" not in kwargs
+    assert kwargs["timeout"] == agent._resolved_api_call_timeout()
     assert "max_tokens" not in kwargs
     assert "extra_body" not in kwargs
+
+
+def test_build_api_kwargs_codex_uses_configured_request_timeout(monkeypatch):
+    monkeypatch.setenv("HERMES_API_TIMEOUT", "123.5")
+    agent = _build_agent(monkeypatch)
+
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
+
+    assert kwargs["timeout"] == 123.5
+
+
+def test_non_stream_stale_timeout_counts_full_responses_payload(monkeypatch):
+    monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "300")
+    agent = _build_agent(monkeypatch)
+    payload = {
+        "model": "gpt-5-codex",
+        "instructions": "system" * 1_000,
+        "input": [{"role": "user", "content": "x" * 205_000}],
+        "tools": [{"name": "terminal", "parameters": {"description": "y" * 1_000}}],
+    }
+
+    assert agent._estimate_non_stream_request_context_tokens(payload) > 50_000
+    assert agent._compute_non_stream_stale_timeout(payload) == 450.0
+
+
+def test_non_stream_stale_timeout_chat_payload_compat(monkeypatch):
+    monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "300")
+    agent = _build_agent(monkeypatch)
+    payload = {"messages": [{"role": "user", "content": "x" * 205_000}]}
+
+    assert agent._estimate_non_stream_request_context_tokens(payload) > 50_000
+    assert agent._compute_non_stream_stale_timeout(payload) == 450.0
 
 
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
@@ -1056,6 +1088,27 @@ def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
     from agent.codex_responses_adapter import _preflight_codex_api_kwargs
     result = _preflight_codex_api_kwargs(kwargs)
     assert result["service_tier"] == "priority"
+
+
+def test_preflight_codex_api_kwargs_preserves_positive_timeout(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["timeout"] = 123.5
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+    assert result["timeout"] == 123.5
+
+
+@pytest.mark.parametrize("bad_timeout", [0, -1, "slow", True, None, float("inf"), float("nan")])
+def test_preflight_codex_api_kwargs_omits_invalid_timeout(monkeypatch, bad_timeout):
+    agent = _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["timeout"] = bad_timeout
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+    assert "timeout" not in result
 
 
 def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):

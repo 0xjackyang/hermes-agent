@@ -80,6 +80,16 @@ class ProviderTransport(ABC):
         """
         return None
 
+    def preflight_kwargs(self, api_kwargs: Any, **kwargs) -> Dict[str, Any]:
+        """Optional: validate/sanitize API kwargs immediately before a call.
+
+        Most transports do all formatting in build_kwargs(). Transports that need
+        a final SDK-specific cleanup pass may override this method. The default
+        accepts extra keyword options so generic call sites can add transport-
+        specific context without breaking transports that do not care about it.
+        """
+        return dict(api_kwargs or {})
+
     def map_finish_reason(self, raw_reason: str) -> str:
         """Optional: map provider-specific stop reason to OpenAI equivalent.
 

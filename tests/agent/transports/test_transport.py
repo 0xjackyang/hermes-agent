@@ -44,6 +44,7 @@ class TestProviderTransportABC:
         assert t.api_mode == "test_minimal"
         assert t.validate_response(None) is True  # default
         assert t.extract_cache_stats(None) is None  # default
+        assert t.preflight_kwargs({"model": "x"}, is_codex_backend=True) == {"model": "x"}
         assert t.map_finish_reason("end_turn") == "end_turn"  # default passthrough
 
 
