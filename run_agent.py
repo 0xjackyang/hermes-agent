@@ -323,6 +323,19 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _estimate_non_stream_request_context_tokens(api_payload: Any) -> int:
+    """Estimate request context tokens for chat or Responses API payloads."""
+    if isinstance(api_payload, dict):
+        payload_sections = [
+            api_payload.get(key)
+            for key in ("messages", "input", "instructions", "tools")
+            if key in api_payload
+        ]
+    else:
+        payload_sections = [api_payload]
+    return sum(len(str(section)) for section in payload_sections) // 4
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -901,14 +914,18 @@ class AIAgent:
 
         return 300.0, True
 
-    def _compute_non_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
+    @staticmethod
+    def _estimate_non_stream_request_context_tokens(api_payload: Any) -> int:
+        return _estimate_non_stream_request_context_tokens(api_payload)
+
+    def _compute_non_stream_stale_timeout(self, api_payload: Any) -> float:
         """Compute the effective non-stream stale timeout for this request."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        est_tokens = sum(len(str(v)) for v in messages) // 4
+        est_tokens = self._estimate_non_stream_request_context_tokens(api_payload)
         if est_tokens > 100_000:
             return max(stale_base, 600.0)
         if est_tokens > 50_000:

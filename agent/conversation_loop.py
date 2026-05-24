@@ -987,7 +987,18 @@ def run_conversation(
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
-                    api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+                    is_codex_backend = (
+                        getattr(agent, "provider", None) == "openai-codex"
+                        or (
+                            getattr(agent, "_base_url_hostname", "") == "chatgpt.com"
+                            and "/backend-api/codex" in getattr(agent, "_base_url_lower", "")
+                        )
+                    )
+                    api_kwargs = agent._get_transport().preflight_kwargs(
+                        api_kwargs,
+                        allow_stream=False,
+                        is_codex_backend=is_codex_backend,
+                    )
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
