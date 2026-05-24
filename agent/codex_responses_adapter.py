@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import uuid
 from types import SimpleNamespace
@@ -745,7 +746,7 @@ def _preflight_codex_api_kwargs(
 
     allowed_keys = {
         "model", "instructions", "input", "tools", "store",
-        "reasoning", "include", "max_output_tokens", "temperature",
+        "reasoning", "include", "max_output_tokens", "temperature", "timeout",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
         "extra_headers", "extra_body",
     }
@@ -769,13 +770,21 @@ def _preflight_codex_api_kwargs(
     if isinstance(service_tier, str) and service_tier.strip():
         normalized["service_tier"] = service_tier.strip()
 
-    # Pass through max_output_tokens and temperature
+    # Pass through max_output_tokens, temperature, and finite positive timeout.
     max_output_tokens = api_kwargs.get("max_output_tokens")
     if isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0:
         normalized["max_output_tokens"] = int(max_output_tokens)
     temperature = api_kwargs.get("temperature")
     if isinstance(temperature, (int, float)):
         normalized["temperature"] = float(temperature)
+    timeout = api_kwargs.get("timeout")
+    if (
+        isinstance(timeout, (int, float))
+        and not isinstance(timeout, bool)
+        and math.isfinite(float(timeout))
+        and timeout > 0
+    ):
+        normalized["timeout"] = timeout
 
     # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
     for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):

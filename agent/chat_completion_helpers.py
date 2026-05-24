@@ -149,9 +149,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # httpx timeout (default 1800s) with zero feedback.  The stale
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
-    _stale_timeout = agent._compute_non_stream_stale_timeout(
-        api_kwargs.get("messages", [])
-    )
+    _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -175,7 +173,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # arrives within the configured timeout.
         _elapsed = time.time() - _call_start
         if _elapsed > _stale_timeout:
-            _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            _est_ctx = agent._estimate_non_stream_request_context_tokens(api_kwargs)
             logger.warning(
                 "Non-streaming API call stale for %.0fs (threshold %.0fs). "
                 "model=%s context=~%s tokens. Killing connection.",
@@ -308,6 +306,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
             max_tokens=agent.max_tokens,
+            timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
