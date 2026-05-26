@@ -91,7 +91,7 @@ class TestCodexBuildKwargs:
         assert kw["timeout"] == 123.5
         assert "reasoning" not in kw
         assert "include" not in kw
-        assert "store" not in kw
+        assert kw["store"] is False  # store must be set False, not stripped (HTTP 400 otherwise)
 
     def test_non_gpt55_codex_backend_keeps_existing_responses_kwargs(self, transport):
         kw = transport.build_kwargs(
@@ -131,7 +131,7 @@ class TestCodexBuildKwargs:
         assert preflight["timeout"] == 123.5
         assert "reasoning" not in preflight
         assert "include" not in preflight
-        assert "store" not in preflight
+        assert preflight["store"] is False  # store must be set False, not stripped
 
     def test_preflight_gpt55_non_codex_backend_keeps_responses_kwargs(self, transport):
         kw = transport.build_kwargs(

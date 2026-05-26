@@ -219,8 +219,11 @@ class ResponsesApiTransport(ProviderTransport):
             # The ChatGPT Codex backend rejects or stalls on these Responses
             # kwargs for GPT-5.5. Strip them last so request_overrides cannot
             # accidentally reintroduce the incompatible fields.
-            for unsupported_key in ("reasoning", "include", "store"):
+            for unsupported_key in ("reasoning", "include"):
                 kwargs.pop(unsupported_key, None)
+            # store MUST be present and False: the ChatGPT Codex backend returns
+            # HTTP 400 "Store must be set to false" when store is absent.
+            kwargs["store"] = False
 
         return kwargs
 
@@ -299,8 +302,11 @@ class ResponsesApiTransport(ProviderTransport):
             # ordinary Responses requests. GPT-5.5 on the ChatGPT Codex backend
             # rejects/stalls on these kwargs, so strip them after normalization
             # too — including the create(stream=True) fallback path.
-            for unsupported_key in ("reasoning", "include", "store"):
+            for unsupported_key in ("reasoning", "include"):
                 normalized.pop(unsupported_key, None)
+            # store MUST be present and False (HTTP 400 otherwise) - applies to
+            # the create(stream=True) fallback path too.
+            normalized["store"] = False
         return normalized
 
     def map_finish_reason(self, raw_reason: str) -> str:
