@@ -210,9 +210,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
             agent._emit_status(
-                f"⚠️ No response from provider for {int(_elapsed)}s "
+                f"⏳ Provider slow: no response in {int(_elapsed)}s "
                 f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                f"Aborting call."
+                f"Retrying."
             )
             try:
                 if agent.api_mode == "anthropic_messages":
