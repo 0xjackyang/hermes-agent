@@ -150,6 +150,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
     _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
+    # chunk-aware watchdog config (autoplan 2026-05-26; default OFF =
+    # observability-first). When on, codex_responses is killed on CONTENT idle
+    # gap instead of total elapsed; total stays a hard backstop (never worse).
+    _wd_enabled = False
+    _wd_idle_ceiling = _stale_timeout
+    try:
+        import time as _wd_time2
+        from hermes_cli.config import load_config as _wd_load_config
+        _wd_acfg = (_wd_load_config() or {}).get("agent", {}) or {}
+        _wd_enabled = bool(_wd_acfg.get("codex_chunk_watchdog", False))
+        _wd_idle_ceiling = float(_wd_acfg.get("codex_chunk_idle_ceiling_s", _stale_timeout) or _stale_timeout)
+    except Exception:
+        _wd_enabled = False
+        _wd_idle_ceiling = _stale_timeout
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -169,15 +183,30 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
             )
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
+        # Stale-call detector. Legacy = total-elapsed. Chunk-aware (flag on,
+        # codex_responses) = CONTENT idle gap OR total backstop.
         _elapsed = time.time() - _call_start
-        if _elapsed > _stale_timeout:
+        _kill_reason = None
+        if _wd_enabled and getattr(agent, "api_mode", None) == "codex_responses":
+            try:
+                with agent._codex_watchdog_lock:
+                    _last_c = getattr(agent, "_codex_last_content_ns", None)
+                    _dcount = getattr(agent, "_codex_content_delta_count", 0)
+                _idle = (_wd_time2.monotonic_ns() - _last_c) / 1e9 if _last_c else _elapsed
+            except Exception:
+                _idle = _elapsed
+                _dcount = 0
+            if _idle > _wd_idle_ceiling:
+                _kill_reason = "content-idle %.0fs > ceiling %.0fs (deltas=%d)" % (_idle, _wd_idle_ceiling, _dcount)
+            elif _elapsed > _stale_timeout:
+                _kill_reason = "total %.0fs > backstop %.0fs" % (_elapsed, _stale_timeout)
+        elif _elapsed > _stale_timeout:
+            _kill_reason = "non-streaming %.0fs > %.0fs" % (_elapsed, _stale_timeout)
+        if _kill_reason is not None:
             _est_ctx = agent._estimate_non_stream_request_context_tokens(api_kwargs)
             logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
+                "API call stale-kill (%s). model=%s context=~%s tokens. Killing connection.",
+                _kill_reason,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
             agent._emit_status(

@@ -187,6 +187,34 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # returns empty output (e.g. chatgpt.com backend-api sends
     # response.incomplete instead of response.completed).
     agent._codex_streamed_text_parts: list = []
+    # chunk-aware watchdog liveness (autoplan 2026-05-26 codex-chunk-watchdog):
+    # interruptible_api_call reads these to detect a stalled stream by CONTENT
+    # gap, not total elapsed. Updated only on real content/reasoning deltas,
+    # never on SSE keepalive/ping/status frames (which would make a dead stream
+    # immortal). monotonic clock + lock per the eng review (shared across the
+    # worker thread that writes and the watchdog thread that reads).
+    import time as _wd_time, threading as _wd_threading
+    if not hasattr(agent, "_codex_watchdog_lock"):
+        agent._codex_watchdog_lock = _wd_threading.Lock()
+    with agent._codex_watchdog_lock:
+        agent._codex_call_start_ns = _wd_time.monotonic_ns()
+        agent._codex_last_content_ns = agent._codex_call_start_ns
+        agent._codex_first_content_ns = None
+        agent._codex_content_delta_count = 0
+        agent._codex_max_gap_ns = 0
+
+    def _wd_mark_content():
+        with agent._codex_watchdog_lock:
+            _n = _wd_time.monotonic_ns()
+            if agent._codex_first_content_ns is None:
+                agent._codex_first_content_ns = _n
+            else:
+                _gap = _n - agent._codex_last_content_ns
+                if _gap > agent._codex_max_gap_ns:
+                    agent._codex_max_gap_ns = _gap
+            agent._codex_last_content_ns = _n
+            agent._codex_content_delta_count += 1
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -203,6 +231,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         delta_text = getattr(event, "delta", "")
                         if delta_text:
                             agent._codex_streamed_text_parts.append(delta_text)
+                            _wd_mark_content()
                         if delta_text and not has_tool_calls:
                             if not first_delta_fired:
                                 first_delta_fired = True
@@ -219,6 +248,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     elif "reasoning" in event_type and "delta" in event_type:
                         reasoning_text = getattr(event, "delta", "")
                         if reasoning_text:
+                            _wd_mark_content()
                             agent._fire_reasoning_delta(reasoning_text)
                     # Collect completed output items — some backends
                     # (chatgpt.com/backend-api/codex) stream valid items
@@ -264,6 +294,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             "Codex stream: synthesized output from %d text deltas (%d chars)",
                             len(agent._codex_streamed_text_parts), len(assembled),
                         )
+                try:
+                    with agent._codex_watchdog_lock:
+                        _cs = agent._codex_call_start_ns
+                        _fc = agent._codex_first_content_ns
+                        _dc = agent._codex_content_delta_count
+                        _mg = agent._codex_max_gap_ns
+                    _ttfb = (_fc - _cs) / 1e9 if _fc else None
+                    logger.info(
+                        "codex-stream-timing model=%s ttfb=%s max_gap=%.1fs "
+                        "content_deltas=%d total=%.1fs",
+                        api_kwargs.get("model", "unknown"),
+                        ("%.1fs" % _ttfb) if _ttfb is not None else "none",
+                        _mg / 1e9, _dc, (_wd_time.monotonic_ns() - _cs) / 1e9,
+                    )
+                except Exception:
+                    pass
                 return final_response
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
