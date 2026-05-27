@@ -796,7 +796,34 @@ class _CodexCompletionsAdapter:
                     elif "function_call" in _etype:
                         has_function_calls = True
                 _check_cancelled()
-                final = stream.get_final_response()
+                try:
+                    final = stream.get_final_response()
+                except (TypeError, AttributeError, KeyError) as _sdk_exc:
+                    # ChatGPT-Codex backend shape changes make the SDK's
+                    # get_final_response() raise (2026-05-27 outage: 'NoneType'
+                    # object is not iterable). Rebuild from the items/deltas
+                    # already collected above instead of failing the auxiliary
+                    # call (e.g. context compression -> "Compression summary
+                    # failed"). Mirrors agent/codex_runtime.py::run_codex_stream.
+                    if collected_output_items:
+                        _recovered = list(collected_output_items)
+                    elif collected_text_deltas and not has_function_calls:
+                        _recovered = [SimpleNamespace(
+                            type="message", role="assistant", status="completed",
+                            content=[SimpleNamespace(
+                                type="output_text",
+                                text="".join(collected_text_deltas),
+                            )],
+                        )]
+                    else:
+                        raise
+                    logger.warning(
+                        "Codex auxiliary: get_final_response parse failed "
+                        "(%s: %s); recovered from %d items + %d deltas.",
+                        type(_sdk_exc).__name__, _sdk_exc,
+                        len(collected_output_items), len(collected_text_deltas),
+                    )
+                    final = SimpleNamespace(output=_recovered, status="completed")
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
