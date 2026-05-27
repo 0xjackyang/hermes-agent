@@ -311,6 +311,38 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 except Exception:
                     pass
                 return final_response
+        except (TypeError, AttributeError, KeyError) as _sdk_exc:
+            # The ChatGPT-Codex backend periodically changes its streamed-
+            # event shape, which makes the OpenAI SDK's stream accumulation /
+            # get_final_response() raise a parse error (2026-05-27 outage:
+            # `'NoneType' object is not iterable` on every gpt-5.5 call). The
+            # only other except clause here catches httpx transport errors, so
+            # the parse error otherwise propagates as a fatal non-retryable
+            # client error and kills the turn. We already captured the real
+            # content via output_item.done / output_text.delta events during
+            # the stream, so rebuild the response from those instead of dying.
+            if collected_output_items:
+                _recovered_output = list(collected_output_items)
+            elif agent._codex_streamed_text_parts and not has_tool_calls:
+                _assembled = "".join(agent._codex_streamed_text_parts)
+                _recovered_output = [SimpleNamespace(
+                    type="message", role="assistant", status="completed",
+                    content=[SimpleNamespace(type="output_text", text=_assembled)],
+                )]
+            else:
+                # Nothing captured to rebuild from — re-raise so the caller's
+                # existing retry / empty-response handling runs rather than us
+                # fabricating a turn out of nothing.
+                raise
+            logger.warning(
+                "Codex stream parse failed (%s: %s); recovered from %d collected "
+                "items + %d text deltas instead of failing the turn. %s",
+                type(_sdk_exc).__name__, _sdk_exc,
+                len(collected_output_items),
+                len(agent._codex_streamed_text_parts),
+                agent._client_log_context(),
+            )
+            return SimpleNamespace(output=_recovered_output, status="completed")
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(

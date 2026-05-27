@@ -890,6 +890,106 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 _INITIALIZED_PATHS: set[str] = set()
 
 
+_KANBAN_CORRUPTION_MARKERS = (
+    "file is not a database",
+    "database disk image is malformed",
+    "malformed database schema",
+)
+
+
+def _is_kanban_corruption(exc: BaseException) -> bool:
+    """True only for SQLite errors meaning the kanban file is unreadable.
+
+    Scoped to corruption (clobbered header / malformed image) so ordinary
+    errors (locked DB, missing table) are NOT mistaken for corruption and
+    cannot trigger a destructive rebuild.
+    """
+    return isinstance(exc, sqlite3.DatabaseError) and any(
+        marker in str(exc).lower() for marker in _KANBAN_CORRUPTION_MARKERS
+    )
+
+
+def _open_kanban_conn(path: Path) -> sqlite3.Connection:
+    """Open + WAL + first-time schema-init for the kanban DB at ``path``.
+
+    Extracted from :func:`connect` so the recovery path can re-open after a
+    repair. Closes the half-open connection on any failure so a corrupt file
+    leaves no dangling handle pinning the inode (which would block the
+    -wal/-shm cleanup in :func:`_repair_corrupt_kanban_db`).
+    """
+    resolved = str(path.resolve())
+    needs_init = resolved not in _INITIALIZED_PATHS
+    conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
+    try:
+        conn.row_factory = sqlite3.Row
+        # WAL doesn't work on network filesystems (NFS/SMB/FUSE).  Shared
+        # helper falls back to DELETE with one WARNING so kanban stays
+        # usable there. See hermes_state._WAL_INCOMPAT_MARKERS.
+        from hermes_state import apply_wal_with_fallback
+        apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        if needs_init:
+            # Idempotent: CREATE TABLE IF NOT EXISTS + additive migrations.
+            conn.executescript(SCHEMA_SQL)
+            _migrate_add_optional_columns(conn)
+            _INITIALIZED_PATHS.add(resolved)
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def _repair_corrupt_kanban_db(path: Path, exc: sqlite3.DatabaseError) -> None:
+    """Recover a corrupt kanban DB in place. KANBAN-ONLY — never state.db.
+
+    An unclean gateway shutdown can desync the ``-wal`` sidecar and leave the
+    header unreadable (``sqlite3.DatabaseError: file is not a database``),
+    which crashes every dispatcher tick (~1/min) until a human recreates the
+    file. Two tiers, least-destructive first:
+
+      1. Drop the ``-wal``/``-shm`` sidecars only — fixes a WAL desync while
+         preserving the committed task rows in the main file.
+      2. If the main file's header is itself clobbered, rebuild empty so the
+         dispatcher stays alive. The board resets (acceptable for ephemeral
+         task state); state.db's durable history is NEVER touched here.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    resolved = str(path.resolve())
+    _INITIALIZED_PATHS.discard(resolved)
+    # Tier 1: WAL desync — drop sidecars, keep the main DB + its rows.
+    for ext in ("-wal", "-shm"):
+        try:
+            os.remove(str(path) + ext)
+        except FileNotFoundError:
+            pass
+    try:
+        with contextlib.closing(_open_kanban_conn(path)) as probe:
+            probe.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        log.warning(
+            "kanban.db (%s): recovered from corruption by dropping WAL "
+            "sidecars; task rows preserved. Original error: %s",
+            path.name, exc,
+        )
+        return
+    except sqlite3.DatabaseError:
+        pass
+    # Tier 2: main-file header clobbered — rebuild empty.
+    _INITIALIZED_PATHS.discard(resolved)
+    for ext in ("", "-wal", "-shm"):
+        try:
+            os.remove(str(path) + ext)
+        except FileNotFoundError:
+            pass
+    log.warning(
+        "kanban.db (%s): header unsalvageable; rebuilt empty so the "
+        "dispatcher stays alive (board reset). Original error: %s",
+        path.name, exc,
+    )
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -918,25 +1018,17 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
-    resolved = str(path.resolve())
-    needs_init = resolved not in _INITIALIZED_PATHS
-    conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
-    conn.row_factory = sqlite3.Row
-    # WAL doesn't work on network filesystems (NFS/SMB/FUSE).  Shared helper
-    # falls back to DELETE with one WARNING so kanban stays usable there.
-    # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-    from hermes_state import apply_wal_with_fallback
-    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    if needs_init:
-        # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-        # migrations. Cached so subsequent connect() calls in the same
-        # process are cheap.
-        conn.executescript(SCHEMA_SQL)
-        _migrate_add_optional_columns(conn)
-        _INITIALIZED_PATHS.add(resolved)
-    return conn
+    try:
+        return _open_kanban_conn(path)
+    except sqlite3.DatabaseError as exc:
+        # Kanban is rebuildable task state (NOT state.db's durable
+        # conversation history), so an unclean-shutdown WAL desync that
+        # clobbers the header is recovered in place instead of crashing the
+        # dispatcher tick until a human runs a manual recreate.
+        if not _is_kanban_corruption(exc):
+            raise
+        _repair_corrupt_kanban_db(path, exc)
+        return _open_kanban_conn(path)
 
 
 def init_db(
